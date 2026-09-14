@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cliff FX — Account Manager</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="chart.min.js"></script>
+<script src="xlsx.min.js"></script>
+<script src="supabase.min.js"></script>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!--
+  APP SHELL — starts with the native `hidden` attribute, not just a CSS
+  class. The native attribute is hidden by the browser's built-in default
+  styles even if styles.css fails to load for any reason, so this markup
+  is never visibly shown before app.js confirms a valid session and
+  explicitly reveals it. Nothing in this file is served to a visitor
+  unless they land here via auth.js's redirect from index.html.
+-->
+<div id="app-shell" class="app-shell" hidden>
+
+  <aside class="sidebar">
+    <div class="brand-mark">Cliff FX</div>
+    <nav class="nav">
+      <button class="nav-item active" data-view="dashboard">Dashboard</button>
+      <button class="nav-item" data-view="trade-log">Trade log</button>
+      <button class="nav-item" data-view="settings">Settings</button>
+    </nav>
+    <button id="sign-out" class="nav-item nav-item-muted">Sign out</button>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="account-switch">
+        <select id="account-select"></select>
+        <button id="new-account-btn" class="btn btn-ghost btn-sm">New account</button>
+      </div>
+      <div class="topbar-balance">
+        <span class="topbar-balance-label">Balance</span>
+        <span id="topbar-balance-value" class="topbar-balance-value">—</span>
+      </div>
+    </header>
+
+    <!-- DASHBOARD VIEW -->
+    <section id="view-dashboard" class="view">
+      <div class="stat-row stat-row-6">
+        <div class="stat-block">
+          <span class="stat-label">Balance</span>
+          <span id="stat-balance" class="stat-value">—</span>
+        </div>
+        <div class="stat-block stat-block-accent">
+          <span class="stat-label">Next trade — risk</span>
+          <span id="stat-next-risk" class="stat-value">—</span>
+          <span id="stat-next-units-hint" class="stat-hint"></span>
+        </div>
+        <div class="stat-block">
+          <span class="stat-label">Current streak</span>
+          <span id="stat-streak" class="stat-value">—</span>
+        </div>
+        <div class="stat-block">
+          <span class="stat-label">Realized win rate</span>
+          <span id="stat-win-rate" class="stat-value">—</span>
+          <span id="stat-win-rate-hint" class="stat-hint"></span>
+        </div>
+        <div class="stat-block">
+          <span class="stat-label">Realized R:R</span>
+          <span id="stat-rr" class="stat-value">—</span>
+          <span id="stat-rr-hint" class="stat-hint"></span>
+        </div>
+        <div class="stat-block">
+          <span class="stat-label">Expectancy / trade</span>
+          <span id="stat-expectancy" class="stat-value">—</span>
+          <span id="stat-expectancy-hint" class="stat-hint"></span>
+        </div>
+      </div>
+
+      <div id="dashboard-band-callout" class="callout hidden">
+        <p id="dashboard-band-label"></p>
+        <p id="dashboard-band-note" class="panel-note"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Equity curve</h2>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="equity-chart"></canvas>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>By setup</h2>
+          <span class="panel-note">Which parts of your process actually have edge</span>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="by-setup-table">
+            <thead>
+              <tr><th>Setup</th><th>Trades</th><th>Win rate</th><th>Expectancy / trade</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <p id="by-setup-empty" class="empty-hint hidden">No tagged trades yet — add a setup when logging a trade to see this breakdown.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Recent trades</h2>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="recent-trades-table">
+            <thead>
+              <tr>
+                <th>#</th><th>Date</th><th>Pair</th><th>Dir</th><th>Result</th>
+                <th>Pips</th><th>Risk %</th><th>P&amp;L</th><th>Balance</th>
+
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <p id="recent-trades-empty" class="empty-hint hidden">No trades logged yet.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- TRADE LOG VIEW -->
+    <section id="view-trade-log" class="view hidden">
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Import from MT5 report (.xlsx)</h2>
+          <span class="panel-note">MT5 → History tab → right-click → Save as Report</span>
+        </div>
+        <p class="panel-note" style="margin: 0 0 0.75rem;">
+          Upload the exported report file. Already-imported trades are detected automatically and
+          skipped — safe to re-upload your full growing history each time rather than tracking what's new yourself.
+        </p>
+        <input type="file" id="xlsx-import-file" accept=".xlsx" />
+        <div style="margin-top: 0.75rem; display: flex; gap: 8px;">
+          <button id="xlsx-parse-btn" type="button" class="btn btn-ghost btn-sm">Parse preview</button>
+          <button id="xlsx-confirm-btn" type="button" class="btn btn-primary btn-sm hidden">Import new trades</button>
+        </div>
+        <div id="xlsx-preview" class="hidden" style="margin-top: 1rem;">
+          <p id="xlsx-summary" class="panel-note"></p>
+          <p id="xlsx-reconcile-note" class="hidden" style="color: var(--warn); font-size: 12px; margin: 0.5rem 0;"></p>
+          <div class="table-wrap">
+            <table class="data-table" id="xlsx-preview-table">
+              <thead>
+                <tr><th>Date</th><th>Pair</th><th>Dir</th><th>Result</th><th>Pips</th><th>Risk %</th><th>P&amp;L</th><th>Balance</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <p id="xlsx-error" class="form-error hidden"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Quick add from a screenshot</h2>
+          <span class="panel-note">Transcribe rows by hand — no pip math needed</span>
+        </div>
+        <p class="panel-note" style="margin: 0 0 0.75rem;">
+          Read straight off your broker's history screen: date, pair, direction, how much you risked (% or $),
+          the result, and the exact P&amp;L. No pips required.
+        </p>
+        <div class="table-wrap">
+          <table class="data-table" id="quick-add-table">
+            <thead>
+              <tr>
+                <th>Date</th><th>Pair</th><th>Dir</th><th>Risk mode</th><th>Risk value</th>
+                <th>Result</th><th>P&amp;L ($)</th><th>Setup</th><th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div style="margin-top: 0.75rem; display: flex; gap: 8px;">
+          <button id="quick-add-row-btn" type="button" class="btn btn-ghost btn-sm">+ Add row</button>
+          <button id="quick-add-save-btn" type="button" class="btn btn-primary btn-sm">Save all rows</button>
+        </div>
+        <p id="quick-add-error" class="form-error hidden"></p>
+        <p id="quick-add-note" class="panel-note hidden"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Log a trade</h2>
+          <span id="suggested-risk-note" class="panel-note"></span>
+        </div>
+        <form id="trade-form" class="trade-form">
+          <div class="form-grid">
+            <div>
+              <label class="field-label" for="trade-pair">Pair / instrument</label>
+              <input type="text" id="trade-pair" placeholder="EURUSD" />
+            </div>
+            <div>
+              <label class="field-label" for="trade-direction">Direction</label>
+              <select id="trade-direction">
+                <option value="long">Long</option>
+                <option value="short">Short</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" for="trade-instrument-type">Sizing basis</label>
+              <select id="trade-instrument-type">
+                <option value="forex">Forex — size by pips</option>
+                <option value="other">Other (metals, indices) — enter $ P&amp;L directly</option>
+              </select>
+            </div>
+            <div id="trade-pip-decimal-wrap">
+              <label class="field-label" for="trade-pip-decimal">Pip size</label>
+              <select id="trade-pip-decimal">
+                <option value="0.0001">Standard (0.0001)</option>
+                <option value="0.01">JPY pairs (0.01)</option>
+              </select>
+            </div>
+            <div id="trade-sl-pips-wrap">
+              <label class="field-label" for="trade-sl-pips">Stop loss (pips)</label>
+              <input type="number" id="trade-sl-pips" step="0.1" min="0.1" />
+            </div>
+            <div>
+              <label class="field-label" for="trade-risk-mode">Risk entry</label>
+              <select id="trade-risk-mode">
+                <option value="pct">% of balance</option>
+                <option value="dollar">$ amount</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" id="trade-risk-value-label" for="trade-risk-value">Risk % (this trade)</label>
+              <input type="number" id="trade-risk-value" step="0.01" min="0.01" required />
+              <span id="trade-risk-value-hint" class="stat-hint"></span>
+            </div>
+            <div id="trade-units-wrap">
+              <label class="field-label" for="trade-units">Suggested units</label>
+              <input type="text" id="trade-units" readonly />
+            </div>
+            <div>
+              <label class="field-label" for="trade-result">Result</label>
+              <select id="trade-result">
+                <option value="win">Win</option>
+                <option value="loss">Loss</option>
+                <option value="breakeven">Breakeven</option>
+              </select>
+            </div>
+            <div id="trade-pips-result-wrap">
+              <label class="field-label" for="trade-pips-result">Actual pips (signed)</label>
+              <input type="number" id="trade-pips-result" step="0.1" />
+            </div>
+            <div id="trade-pnl-direct-wrap" class="hidden">
+              <label class="field-label" for="trade-pnl-direct">P&amp;L amount (signed $)</label>
+              <input type="number" id="trade-pnl-direct" step="0.01" />
+            </div>
+            <div>
+              <label class="field-label" for="trade-date">Date</label>
+              <input type="date" id="trade-date" />
+            </div>
+            <div>
+              <label class="field-label" for="trade-setup">Setup</label>
+              <input type="text" id="trade-setup" list="setup-tag-options" placeholder="Order Block" />
+              <datalist id="setup-tag-options">
+                <option value="Liquidity Sweep">
+                <option value="Order Block">
+                <option value="Fair Value Gap">
+                <option value="Breaker Block">
+                <option value="OTE">
+                <option value="Judas Swing">
+                <option value="Killzone Continuation">
+                <option value="Range / Premium-Discount">
+              </datalist>
+            </div>
+          </div>
+          <div>
+            <label class="field-label" for="trade-notes">Notes</label>
+            <textarea id="trade-notes" rows="2" placeholder="Session, anything worth remembering"></textarea>
+          </div>
+
+          <div class="checklist-block">
+            <div class="checklist-header">
+              <span class="field-label" style="margin: 0;">Pre-trade checklist</span>
+              <span id="checklist-score" class="checklist-score"></span>
+            </div>
+
+            <label class="field-label" for="checklist-scenario">Weekly / Daily / H4 scenario</label>
+            <select id="checklist-scenario">
+              <option value="">— Not classified —</option>
+            </select>
+
+            <div id="checklist-rules" class="checklist-rules"></div>
+          </div>
+
+          <p id="trade-form-error" class="form-error hidden"></p>
+          <button type="submit" class="btn btn-primary">Log trade</button>
+        </form>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h2>All trades</h2></div>
+        <div class="table-wrap">
+          <table class="data-table" id="all-trades-table">
+            <thead>
+              <tr>
+                <th>#</th><th>Date</th><th>Pair</th><th>Dir</th><th>SL pips</th><th>Result</th>
+                <th>Pips</th><th>Risk %</th><th>Units</th><th>P&amp;L</th><th>Balance</th><th>Rules</th><th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <p id="all-trades-empty" class="empty-hint hidden">No trades logged yet.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- SETTINGS VIEW -->
+    <section id="view-settings" class="view hidden">
+      <div class="panel">
+        <div class="panel-header"><h2>Account</h2></div>
+        <div class="form-grid">
+          <div>
+            <label class="field-label" for="settings-account-name">Account name</label>
+            <input type="text" id="settings-account-name" />
+          </div>
+          <div>
+            <label class="field-label" for="settings-starting-balance">Starting balance</label>
+            <input type="number" id="settings-starting-balance" step="0.01" min="0.01" />
+            <span class="panel-note">Editing this recalculates every logged trade's running balance to match.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Sizing model</h2>
+          <span class="panel-note">Cut on loss, scale on win — tuned to your win rate and R:R.</span>
+        </div>
+
+        <div id="realized-stats-callout" class="callout hidden">
+          <p id="realized-stats-summary"></p>
+          <p id="realized-stats-band-note" class="panel-note"></p>
+          <button id="use-realized-stats-btn" type="button" class="btn btn-ghost btn-sm">Use my realized win rate + R:R</button>
+        </div>
+        <p id="realized-stats-empty" class="panel-note hidden">Log at least 5 decided trades to see your realized win rate and R:R here — until then, the fields below are your own estimate.</p>
+
+        <div class="start-style-group">
+          <label class="field-label">Start style</label>
+          <div class="start-style-options">
+            <label class="start-style-option">
+              <input type="radio" name="start-style" value="modest" checked />
+              <div>
+                <strong>Modest</strong>
+                <p>Starts small, cuts to base risk on the very first loss within your band, ramps up slowly on
+                confirmed wins. Smoother equity curve, the best-performing approach in the reference case.</p>
+              </div>
+            </label>
+            <label class="start-style-option">
+              <input type="radio" name="start-style" value="aggressive" />
+              <div>
+                <strong>Aggressive</strong>
+                <p>Higher base risk, tolerates a longer losing streak before cutting, ramps to max size faster.
+                Bigger swings both ways — can compound faster, but with real drawdown risk along the way.</p>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <div class="form-grid">
+          <div>
+            <label class="field-label" for="settings-win-rate">Assumed win rate (%)</label>
+            <input type="number" id="settings-win-rate" step="1" min="1" max="99" />
+          </div>
+          <div>
+            <label class="field-label" for="settings-rr">Reward:risk ratio</label>
+            <input type="number" id="settings-rr" step="0.1" min="0.1" />
+          </div>
+          <div>
+            <label class="field-label" for="settings-base-risk">Base risk % per trade</label>
+            <input type="number" id="settings-base-risk" step="0.1" min="0.1" />
+          </div>
+        </div>
+
+        <button id="suggest-defaults-btn" type="button" class="btn btn-ghost btn-sm">Suggest settings from win rate + R:R</button>
+
+        <div class="form-grid" style="margin-top: 1.25rem;">
+          <div>
+            <label class="field-label" for="settings-loss-trigger">Cut to base after this many losses</label>
+            <input type="number" id="settings-loss-trigger" step="1" min="1" />
+          </div>
+          <div>
+            <label class="field-label" for="settings-escalation-step">Risk % increase per confirmed win</label>
+            <input type="number" id="settings-escalation-step" step="0.01" min="0" />
+          </div>
+          <div>
+            <label class="field-label" for="settings-max-risk">Max risk % (cap)</label>
+            <input type="number" id="settings-max-risk" step="0.1" min="0.1" />
+          </div>
+          <div>
+            <label class="field-label" for="settings-pip-decimal">Default pip decimal</label>
+            <select id="settings-pip-decimal">
+              <option value="0.0001">Standard (0.0001)</option>
+              <option value="0.01">JPY pairs (0.01)</option>
+            </select>
+          </div>
+        </div>
+        <p class="panel-note" style="margin-top: 0.5rem;">
+          Only used as the starting default on the dashboard and a new trade form — it auto-switches per trade
+          based on the pair you type (JPY pairs get 0.01 automatically), and non-forex instruments skip pip math entirely.
+        </p>
+
+        <p id="settings-error" class="form-error hidden"></p>
+        <button id="save-settings-btn" type="button" class="btn btn-primary">Save settings</button>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<!-- NEW ACCOUNT MODAL -->
+<div id="new-account-modal" class="modal-overlay hidden">
+  <div class="modal">
+    <h2>New account</h2>
+    <label class="field-label" for="new-account-name">Name</label>
+    <input type="text" id="new-account-name" placeholder="e.g. Main, Prop firm eval" />
+    <label class="field-label" for="new-account-balance">Starting balance</label>
+    <input type="number" id="new-account-balance" step="0.01" min="1" placeholder="5000" />
+    <p id="new-account-error" class="form-error hidden"></p>
+    <div class="modal-actions">
+      <button id="new-account-cancel" class="btn btn-ghost">Cancel</button>
+      <button id="new-account-create" class="btn btn-primary">Create account</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast notifications (confirmations) -->
+<div id="toast" class="toast hidden"></div>
+
+<script src="supabaseClient.js"></script>
+<script src="sizingEngine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
