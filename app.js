@@ -186,15 +186,10 @@ function renderDashboard() {
   document.getElementById('topbar-balance-value').textContent = formatMoney(balance);
 
   const next = nextRisk();
-  document.getElementById('stat-next-risk').textContent = `${next.riskPct.toFixed(2)}%`;
-
-  const units = SizingEngine.computePositionUnits({
-    balance,
-    riskPct: next.riskPct,
-    stopLossPips: currentSettings.default_stop_loss_pips,
-    pipDecimal: parseFloat(currentSettings.pip_decimal || 0.0001),
-  });
-  document.getElementById('stat-next-units-hint').textContent = unitsHint(units, currentSettings.default_stop_loss_pips);
+  const nextDollars = SizingEngine.riskPctToAmount(next.riskPct, balance);
+  document.getElementById('stat-next-risk').textContent = nextDollars !== null ? formatMoney(nextDollars) : `${next.riskPct.toFixed(2)}%`;
+  document.getElementById('stat-next-units-hint').textContent =
+    `${next.riskPct.toFixed(2)}% of ${formatMoney(balance)} — risk this much if the stop is hit`;
 
   const streakLabel = next.streakType
     ? `${next.streakCount} ${next.streakType}${next.streakCount > 1 ? 's' : ''} in a row`
@@ -205,14 +200,6 @@ function renderDashboard() {
   runSafely('by setup', renderBySetup);
   runSafely('equity chart', renderEquityChart);
   runSafely('recent trades', renderRecentTrades);
-}
-
-/** Formats a units figure as a hint including the lot-size equivalent, since that's what you actually enter in a broker's order ticket. */
-function unitsHint(units, stopLossPips) {
-  const lots = SizingEngine.unitsToLots(units);
-  let hint = `≈ ${units.toLocaleString()} units (${lots} lots) at a ${stopLossPips}-pip stop`;
-  if (lots < 0.01) hint += ' — below most brokers\' 0.01 lot minimum';
-  return hint;
 }
 
 function renderRealizedStats() {
@@ -352,10 +339,19 @@ function renderTradeLog() {
   [...currentTrades].reverse().forEach((t) => tbody.appendChild(tradeRow(t, true)));
 
   const next = nextRisk();
-  document.getElementById('trade-risk-mode').value = 'pct';
-  document.getElementById('trade-risk-value-label').textContent = 'Risk % (this trade)';
-  document.getElementById('trade-risk-value').value = next.riskPct.toFixed(2);
-  document.getElementById('trade-sl-pips').value = currentSettings.default_stop_loss_pips;
+  const suggestedDollars = SizingEngine.riskPctToAmount(next.riskPct, currentBalance());
+  if (suggestedDollars !== null) {
+    document.getElementById('trade-risk-mode').value = 'dollar';
+    document.getElementById('trade-risk-value-label').textContent = 'Risk $ amount (this trade)';
+    document.getElementById('trade-risk-value').value = suggestedDollars.toFixed(2);
+  } else {
+    document.getElementById('trade-risk-mode').value = 'pct';
+    document.getElementById('trade-risk-value-label').textContent = 'Risk % (this trade)';
+    document.getElementById('trade-risk-value').value = next.riskPct.toFixed(2);
+  }
+  // Left blank on purpose (placeholder only): a pre-filled default would get recorded as if it were the real stop.
+  document.getElementById('trade-sl-pips').value = '';
+  document.getElementById('trade-sl-pips').placeholder = String(currentSettings.default_stop_loss_pips);
   document.getElementById('trade-date').value = new Date().toISOString().slice(0, 10);
   updateRiskValueHint();
   updateSuggestedUnits();
@@ -674,6 +670,8 @@ function wireTradeForm() {
     applyInstrumentType(e.target.value);
   });
 
+  document.getElementById('trade-result-mode').addEventListener('change', applyResultMode);
+
   document.getElementById('trade-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     hideError('trade-form-error');
@@ -708,27 +706,55 @@ function wireTradeForm() {
     };
 
     if (instrumentType === 'forex') {
+      const resultMode = document.getElementById('trade-result-mode').value;
       const slPips = parseFloat(document.getElementById('trade-sl-pips').value);
-      const pipsResult = parseFloat(document.getElementById('trade-pips-result').value);
       const pipDecimal = parseFloat(document.getElementById('trade-pip-decimal').value);
+      const hasStop = !!slPips && slPips > 0;
 
-      if (!slPips || slPips <= 0) return showError('trade-form-error', 'Enter a stop loss in pips.');
-      if (isNaN(pipsResult)) return showError('trade-form-error', 'Enter the actual pip result (negative for a loss).');
+      if (resultMode === 'pips') {
+        const pipsResult = parseFloat(document.getElementById('trade-pips-result').value);
+        if (!hasStop) return showError('trade-form-error', 'Enter a stop loss in pips.');
+        if (isNaN(pipsResult)) return showError('trade-form-error', 'Enter the actual pip result (negative for a loss).');
 
-      const units = SizingEngine.computePositionUnits({ balance: balanceBefore, riskPct, stopLossPips: slPips, pipDecimal });
-      const pnl = SizingEngine.computePnl({ units, pipsResult, pipDecimal });
+        const units = SizingEngine.computePositionUnits({ balance: balanceBefore, riskPct, stopLossPips: slPips, pipDecimal });
+        const pnl = SizingEngine.computePnl({ units, pipsResult, pipDecimal });
 
-      payload = {
-        ...payload,
-        stop_loss_pips: slPips,
-        pips_result: pipsResult,
-        position_units: units,
-        pnl_amount: pnl,
-        balance_after: round2(balanceBefore + pnl),
-      };
+        payload = {
+          ...payload,
+          stop_loss_pips: slPips,
+          pips_result: pipsResult,
+          position_units: units,
+          pnl_amount: pnl,
+          balance_after: round2(balanceBefore + pnl),
+        };
+      } else {
+        // $ result entry: the amount you typed is the source of truth. A stop
+        // distance is optional here — if given, units are recorded and the
+        // pip result is back-derived for the table; if not, they stay blank.
+        const pnl = parseFloat(document.getElementById('trade-pnl-direct').value);
+        if (isNaN(pnl)) return showError('trade-form-error', 'Enter the $ P&L for this trade (negative for a loss).');
+        if (resultContradictsPnl(result, pnl)) return showError('trade-form-error', `Result says "${result}" but the P&L is ${formatMoney(pnl, true)} — fix one of them.`);
+
+        let units = null;
+        let pipsResult = null;
+        if (hasStop) {
+          units = SizingEngine.computePositionUnits({ balance: balanceBefore, riskPct, stopLossPips: slPips, pipDecimal });
+          if (units > 0) pipsResult = round2(pnl / (units * pipDecimal));
+        }
+
+        payload = {
+          ...payload,
+          stop_loss_pips: hasStop ? slPips : null,
+          pips_result: pipsResult,
+          position_units: units,
+          pnl_amount: round2(pnl),
+          balance_after: round2(balanceBefore + pnl),
+        };
+      }
     } else {
       const pnl = parseFloat(document.getElementById('trade-pnl-direct').value);
       if (isNaN(pnl)) return showError('trade-form-error', 'Enter the $ P&L for this trade.');
+      if (resultContradictsPnl(result, pnl)) return showError('trade-form-error', `Result says "${result}" but the P&L is ${formatMoney(pnl, true)} — fix one of them.`);
 
       payload = {
         ...payload,
@@ -800,6 +826,11 @@ function resetChecklistForm() {
   updateChecklistScoreDisplay();
 }
 
+/** Win/loss must agree with the sign of a directly-typed P&L, otherwise win rate and expectancy get quietly corrupted. */
+function resultContradictsPnl(result, pnl) {
+  return (result === 'win' && pnl < 0) || (result === 'loss' && pnl > 0);
+}
+
 /** Resolves the current trade form's risk value into a risk %, regardless of entry mode. */
 function currentRiskPct() {
   const mode = document.getElementById('trade-risk-mode').value;
@@ -822,9 +853,17 @@ function applyInstrumentType(type) {
   document.getElementById('trade-pip-decimal-wrap').classList.toggle('hidden', !isForex);
   document.getElementById('trade-sl-pips-wrap').classList.toggle('hidden', !isForex);
   document.getElementById('trade-units-wrap').classList.toggle('hidden', !isForex);
-  document.getElementById('trade-pips-result-wrap').classList.toggle('hidden', !isForex);
-  document.getElementById('trade-pnl-direct-wrap').classList.toggle('hidden', isForex);
+  document.getElementById('trade-result-mode-wrap').classList.toggle('hidden', !isForex);
+  applyResultMode();
   updateSuggestedUnits();
+}
+
+/** Pips vs $ result entry. Non-forex instruments always enter $ directly. */
+function applyResultMode() {
+  const isForex = document.getElementById('trade-instrument-type').value === 'forex';
+  const byPips = isForex && document.getElementById('trade-result-mode').value === 'pips';
+  document.getElementById('trade-pips-result-wrap').classList.toggle('hidden', !byPips);
+  document.getElementById('trade-pnl-direct-wrap').classList.toggle('hidden', byPips);
 }
 
 function updateSuggestedUnits() {

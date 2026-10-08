@@ -54,7 +54,7 @@
           <span id="stat-balance" class="stat-value">—</span>
         </div>
         <div class="stat-block stat-block-accent">
-          <span class="stat-label">Next trade — risk</span>
+          <span class="stat-label">Next trade — risk ($)</span>
           <span id="stat-next-risk" class="stat-value">—</span>
           <span id="stat-next-units-hint" class="stat-hint"></span>
         </div>
@@ -222,7 +222,7 @@
               </select>
             </div>
             <div id="trade-sl-pips-wrap">
-              <label class="field-label" for="trade-sl-pips">Stop loss (pips)</label>
+              <label class="field-label" for="trade-sl-pips">Stop loss (pips, optional)</label>
               <input type="number" id="trade-sl-pips" step="0.1" min="0.1" />
             </div>
             <div>
@@ -249,11 +249,18 @@
                 <option value="breakeven">Breakeven</option>
               </select>
             </div>
-            <div id="trade-pips-result-wrap">
+            <div id="trade-result-mode-wrap">
+              <label class="field-label" for="trade-result-mode">Result entry</label>
+              <select id="trade-result-mode">
+                <option value="dollar">$ amount</option>
+                <option value="pips">Pips</option>
+              </select>
+            </div>
+            <div id="trade-pips-result-wrap" class="hidden">
               <label class="field-label" for="trade-pips-result">Actual pips (signed)</label>
               <input type="number" id="trade-pips-result" step="0.1" />
             </div>
-            <div id="trade-pnl-direct-wrap" class="hidden">
+            <div id="trade-pnl-direct-wrap">
               <label class="field-label" for="trade-pnl-direct">P&amp;L amount (signed $)</label>
               <input type="number" id="trade-pnl-direct" step="0.01" />
             </div>

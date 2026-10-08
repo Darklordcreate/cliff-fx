@@ -106,6 +106,20 @@ function riskAmountToPct(amount, balance) {
 }
 
 /**
+ * Converts a risk % into a dollar amount of the given balance — the
+ * inverse of riskAmountToPct. The next-trade recommendation is shown in
+ * dollars because that's the number you can act on directly, without
+ * going through a lot-size calculation.
+ * @param {number} pct risk as a percent of balance, e.g. 3
+ * @param {number} balance
+ * @returns {number|null}
+ */
+function riskPctToAmount(pct, balance) {
+  if (balance === null || balance === undefined || isNaN(balance) || balance <= 0 || pct === null || pct === undefined || isNaN(pct)) return null;
+  return round2((pct / 100) * balance);
+}
+
+/**
  * Computes realized win rate and reward:risk from actual logged trades.
  * Uses each trade's real $ P&L, so partial closes and breakevens are
  * naturally reflected (no assumption of a "full" win or loss).
@@ -675,6 +689,7 @@ const SizingEngine = {
   detectPipDecimal,
   classifyWinRateBand,
   riskAmountToPct,
+  riskPctToAmount,
   computeRealizedStats,
   computeStatsBySetup,
   CHECKLIST_RULES,

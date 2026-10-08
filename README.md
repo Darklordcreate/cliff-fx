@@ -209,22 +209,30 @@ Now:
 If you ever see a "part of the page failed to load" toast, your data
 is safe — check the browser console for the actual error.
 
-## Suggested units — how to actually use it when placing a trade
+## Dollar-first: the recommendation and the result
 
-Every "Suggested units" / "Next trade — risk" figure now shows **lots**
-first, since that's what you type into your broker's order ticket, not
-"units":
+**Next-trade risk is shown in dollars.** The dashboard's "Next trade —
+risk ($)" is the amount to risk if the stop is hit (e.g. `$1.93`), with
+the percentage and balance underneath as context. No lot-size
+calculation is forced on you. The "Log a trade" form pre-fills that
+dollar figure in `$ amount` risk mode.
 
-`785 units` becomes `0.008 lots (785 units)`
+**Results can be typed as a dollar P&L, not just pips.** "Result entry"
+on the trade form defaults to `$ amount` — type what the trade actually
+made or lost (negative for a loss). The stop loss in pips is optional in
+this mode: if you give one, units are recorded and the pip result is
+back-derived for the table; if you leave it blank, those stay blank
+rather than being invented. The stop field is no longer pre-filled with
+the account default for exactly that reason. Switch "Result entry" to
+`Pips` to get the old pip-based flow back.
 
-A standard lot is 100,000 units, so lots = units ÷ 100,000. If the
-suggested lot size comes out under 0.01, the app flags it — most
-brokers won't accept an order smaller than a 0.01 lot (a "micro lot"),
-so on a very small account a correctly-sized risk % can come out
-untradeable as a literal position. If you see that warning regularly,
-it usually means either the account is too small for the pip-based
-sizing math to produce a tradeable position at your current risk %, or
-it's worth checking whether your broker supports smaller minimums.
+The form also blocks a Result/P&L contradiction (e.g. "Win" with a
+negative amount) so win rate and expectancy can't be silently corrupted
+by a mis-click.
+
+If you still want lot sizes for a particular trade, enter a stop in
+pips and the form's "Suggested units" field shows lots (1 lot = 100,000
+units; most brokers' minimum is 0.01 lot).
 
 ## Expectancy and setup tagging
 
