@@ -6,6 +6,9 @@ let currentAccount = null;
 let currentSettings = null;
 let currentTrades = [];
 let equityChart = null;
+let drawdownChart = null;
+let equityMode = 'balance';   // 'balance' | 'performance'
+let equityRange = 'ALL';      // '1W' | '1M' | 'ALL'
 
 // Sensible fallback if a settings row is ever missing/unreadable, so
 // rendering never silently breaks — a save always overwrites these anyway.
@@ -25,6 +28,7 @@ async function init() {
   wireTradeForm();
   wireQuickAddGrid();
   wireXlsxImportPanel();
+  wireChartControls();
 
   // This page (app.html) only ever renders authenticated content. If
   // there's no session — direct navigation, a stale bookmark, whatever —
@@ -181,25 +185,79 @@ function nextRisk() {
 
 // ---------- Dashboard ----------
 function renderDashboard() {
-  const balance = currentBalance();
-  document.getElementById('stat-balance').textContent = formatMoney(balance);
-  document.getElementById('topbar-balance-value').textContent = formatMoney(balance);
+  document.getElementById('topbar-balance-value').textContent = formatMoney(currentBalance());
 
-  const next = nextRisk();
-  const nextDollars = SizingEngine.riskPctToAmount(next.riskPct, balance);
-  document.getElementById('stat-next-risk').textContent = nextDollars !== null ? formatMoney(nextDollars) : `${next.riskPct.toFixed(2)}%`;
-  document.getElementById('stat-next-units-hint').textContent =
-    `${next.riskPct.toFixed(2)}% of ${formatMoney(balance)} — risk this much if the stop is hit`;
-
-  const streakLabel = next.streakType
-    ? `${next.streakCount} ${next.streakType}${next.streakCount > 1 ? 's' : ''} in a row`
-    : 'No streak yet';
-  document.getElementById('stat-streak').textContent = streakLabel;
-
+  runSafely('next trade', renderHero);
+  runSafely('performance cards', renderPerformanceKpis);
   runSafely('realized stats', renderRealizedStats);
   runSafely('by setup', renderBySetup);
   runSafely('equity chart', renderEquityChart);
   runSafely('recent trades', renderRecentTrades);
+}
+
+/** "1 win", "3 wins", "1 loss", "3 losses" — with correct plurals. */
+function streakLabel(type, count) {
+  const word = type === 'win' ? (count > 1 ? 'wins' : 'win') : (count > 1 ? 'losses' : 'loss');
+  return `${count} ${word}`;
+}
+
+/** Next-trade card: dollar risk first, what happens after a win vs a loss, and the recent R strip. */
+function renderHero() {
+  const balance = currentBalance();
+  const preview = SizingEngine.previewNextRisk(currentTrades, currentSettings, balance);
+  const cur = preview.current;
+
+  document.getElementById('hero-risk').textContent = cur.dollars !== null ? formatMoney(cur.dollars) : `${cur.riskPct.toFixed(2)}%`;
+  document.getElementById('hero-risk-hint').textContent =
+    `${cur.riskPct.toFixed(2)}% of ${formatMoney(balance)} — what you lose if the stop is hit`;
+
+  const branchText = (b) => (b.dollars !== null ? `${formatMoney(b.dollars)} · ${b.riskPct.toFixed(2)}%` : `${b.riskPct.toFixed(2)}%`);
+  document.getElementById('branch-win-value').textContent = branchText(preview.ifWin);
+  document.getElementById('branch-loss-value').textContent = branchText(preview.ifLoss);
+
+  document.getElementById('hero-streak').textContent = cur.streakType
+    ? `Current run: ${streakLabel(cur.streakType, cur.streakCount)} in a row`
+    : 'No run yet';
+
+  // Recent results as R-multiples (deposits/credits aren't trades).
+  const rs = SizingEngine.computeRMultiples(currentTrades, currentAccount.starting_balance);
+  const recent = currentTrades
+    .map((t, i) => ({ t, r: rs[i].r }))
+    .filter((x) => !SizingEngine.isLedgerRow(x.t))
+    .slice(-8);
+
+  const strip = document.getElementById('streak-strip');
+  strip.innerHTML = '';
+  recent.forEach(({ t, r }) => {
+    const chip = document.createElement('div');
+    chip.className = `chip-r ${t.result === 'win' ? 'chip-win' : t.result === 'loss' ? 'chip-loss' : 'chip-be'}`;
+    chip.textContent = t.result === 'win' ? 'W' : t.result === 'loss' ? 'L' : 'BE';
+    const small = document.createElement('small');
+    small.textContent = r === null ? '—' : `${r > 0 ? '+' : ''}${r.toFixed(1)}R`;
+    chip.appendChild(small);
+    strip.appendChild(chip);
+  });
+  const next = document.createElement('div');
+  next.className = 'chip-r chip-next';
+  next.textContent = 'NEXT';
+  strip.appendChild(next);
+}
+
+/** Balance + deposit-neutral drawdown cards. */
+function renderPerformanceKpis() {
+  const balance = currentBalance();
+  const start = Number(currentAccount.starting_balance);
+  const series = SizingEngine.computeEquitySeries(currentTrades, start);
+
+  const peakBalance = Math.max(start, ...series.map((p) => p.balance));
+  document.getElementById('kpi-balance').textContent = formatMoney(balance);
+  document.getElementById('kpi-balance-hint').textContent = `Peak balance ${formatMoney(peakBalance)}`;
+
+  const dd = SizingEngine.computeDrawdownSeries([100, ...series.map((p) => p.index)]);
+  const ddEl = document.getElementById('kpi-dd');
+  ddEl.textContent = dd.currentDrawdownPct > 0 ? `-${dd.currentDrawdownPct.toFixed(1)}%` : '0.0%';
+  ddEl.classList.toggle('loss-text', dd.currentDrawdownPct > 0);
+  document.getElementById('kpi-dd-hint').textContent = `worst ${dd.maxDrawdownPct.toFixed(1)}% · deposits don't count as recovery`;
 }
 
 function renderRealizedStats() {
@@ -284,28 +342,104 @@ function renderBySetup() {
   });
 }
 
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
 function renderEquityChart() {
   if (typeof Chart === 'undefined') {
     console.error('Chart.js did not load — equity curve cannot render.');
     return; // runSafely's caller already isolates this from breaking anything else
   }
-  const ctx = document.getElementById('equity-chart').getContext('2d');
-  const points = [currentAccount.starting_balance, ...currentTrades.map((t) => t.balance_after)];
-  const labels = points.map((_, i) => (i === 0 ? 'Start' : `#${i}`));
 
-  if (equityChart) equityChart.destroy();
-  equityChart = new Chart(ctx, {
+  const start = Number(currentAccount.starting_balance);
+  const all = SizingEngine.computeEquitySeries(currentTrades, start);
+  const today = new Date().toISOString().slice(0, 10);
+  const points = SizingEngine.sliceByRange(all, equityRange, today);
+  const hasData = points.length > 0;
+
+  document.getElementById('equity-wrap').classList.toggle('hidden', !hasData);
+  document.getElementById('dd-block').classList.toggle('hidden', !hasData);
+  document.getElementById('equity-empty').classList.toggle('hidden', hasData);
+  if (equityChart) { equityChart.destroy(); equityChart = null; }
+  if (drawdownChart) { drawdownChart.destroy(); drawdownChart = null; }
+  if (!hasData) { document.getElementById('equity-note').textContent = ''; return; }
+
+  // What the window starts from: the point just before it (or the account start).
+  const firstIdx = all.indexOf(points[0]);
+  const baseBalance = firstIdx > 0 ? all[firstIdx - 1].balance : start;
+  const baseIndex = firstIdx > 0 ? all[firstIdx - 1].index : 100;
+
+  const labels = ['Start', ...points.map((p) => `#${p.trade_number}`)];
+  const perf = equityMode === 'performance';
+  const values = perf
+    ? [0, ...points.map((p) => Math.round((p.index / baseIndex - 1) * 10000) / 100)]
+    : [baseBalance, ...points.map((p) => p.balance)];
+
+  let peak = -Infinity;
+  const hwm = values.map((v) => { peak = Math.max(peak, v); return peak; });
+
+  const accent = cssVar('--accent');
+  const loss = cssVar('--loss');
+  const muted = cssVar('--text-muted');
+  const grid = cssVar('--border');
+  const tick = (v) => (perf ? `${v}%` : `$${v}`);
+
+  const ledgerFlags = [false, ...points.map((p) => p.ledger)];
+
+  equityChart = new Chart(document.getElementById('equity-chart').getContext('2d'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: perf ? 'Performance %' : 'Balance',
+          data: values,
+          borderColor: accent,
+          backgroundColor: 'rgba(31, 227, 196, 0.07)',
+          fill: true,
+          tension: 0.15,
+          borderWidth: 2,
+          pointRadius: ledgerFlags.map((l) => (l ? 4 : 0)),
+          pointBackgroundColor: accent,
+          pointBorderColor: accent,
+        },
+        {
+          label: 'High-water mark',
+          data: hwm,
+          borderColor: muted,
+          borderDash: [5, 5],
+          borderWidth: 1,
+          pointRadius: 0,
+          fill: false,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: muted, maxTicksLimit: 8 }, grid: { color: grid } },
+        y: { ticks: { color: muted, callback: tick }, grid: { color: grid } },
+      },
+    },
+  });
+
+  // Drawdown strip — always deposit-neutral (built from the performance index).
+  const dd = SizingEngine.computeDrawdownSeries([baseIndex, ...points.map((p) => p.index)]);
+  drawdownChart = new Chart(document.getElementById('drawdown-chart').getContext('2d'), {
     type: 'line',
     data: {
       labels,
       datasets: [{
-        data: points,
-        borderColor: '#5B8DEF',
-        backgroundColor: 'rgba(91,141,239,0.08)',
-        fill: true,
+        data: dd.drawdowns,
+        borderColor: loss,
+        backgroundColor: 'rgba(212, 119, 93, 0.15)',
+        fill: 'origin',
         tension: 0.15,
+        borderWidth: 1.5,
         pointRadius: 0,
-        borderWidth: 2,
       }],
     },
     options: {
@@ -313,11 +447,31 @@ function renderEquityChart() {
       maintainAspectRatio: false,
       plugins: { legend: { display: false } },
       scales: {
-        x: { ticks: { color: '#868D99', maxTicksLimit: 8 }, grid: { color: '#262B33' } },
-        y: { ticks: { color: '#868D99' }, grid: { color: '#262B33' } },
+        x: { display: false },
+        y: { max: 0, ticks: { color: muted, maxTicksLimit: 3, callback: (v) => `${v}%` }, grid: { color: grid } },
       },
     },
   });
+
+  const hasLedger = points.some((p) => p.ledger);
+  document.getElementById('equity-note').textContent = perf
+    ? 'Performance % compounds trade returns only — money you add is ignored. Drawdown below uses the same basis.'
+    : `Balance includes money you add${hasLedger ? ' (teal dots mark deposits and credits)' : ''}. The drawdown strip below ignores deposits, so adding money never looks like recovery.`;
+}
+
+function wireChartControls() {
+  const bind = (containerId, attr, setter) => {
+    document.querySelectorAll(`#${containerId} button`).forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll(`#${containerId} button`).forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        setter(btn.dataset[attr]);
+        runSafely('equity chart', renderEquityChart);
+      });
+    });
+  };
+  bind('equity-mode', 'mode', (v) => { equityMode = v; });
+  bind('equity-range', 'range', (v) => { equityRange = v; });
 }
 
 function renderRecentTrades() {
@@ -357,7 +511,7 @@ function renderTradeLog() {
   updateSuggestedUnits();
 
   const streakNote = next.streakType
-    ? `Suggested from ${next.streakCount} ${next.streakType}${next.streakCount > 1 ? 's' : ''} in a row.`
+    ? `Suggested from ${streakLabel(next.streakType, next.streakCount)} in a row.`
     : 'First trade on this account — using base risk.';
   document.getElementById('suggested-risk-note').textContent = streakNote;
 
@@ -880,6 +1034,10 @@ function updateSuggestedUnits() {
 
 // ---------- Settings ----------
 function wireSettingsForm() {
+  ['settings-base-risk', 'settings-escalation-step', 'settings-max-risk'].forEach((id) => {
+    document.getElementById(id).addEventListener('input', updateSettingsDollarHints);
+  });
+
   document.getElementById('suggest-defaults-btn').addEventListener('click', () => {
     const winRate = parseFloat(document.getElementById('settings-win-rate').value) / 100;
     const rr = parseFloat(document.getElementById('settings-rr').value);
@@ -896,6 +1054,7 @@ function wireSettingsForm() {
     document.getElementById('settings-loss-trigger').value = suggested.lossCutTrigger;
     document.getElementById('settings-escalation-step').value = suggested.escalationStepPct;
     document.getElementById('settings-max-risk').value = suggested.maxRiskPct;
+    updateSettingsDollarHints();
   });
 
   document.getElementById('use-realized-stats-btn').addEventListener('click', () => {
@@ -958,6 +1117,20 @@ function wireSettingsForm() {
   });
 }
 
+/** Shows each risk percentage in Settings as a dollar amount at today's balance. */
+function updateSettingsDollarHints() {
+  if (!currentAccount) return;
+  const balance = currentBalance();
+  const hint = (inputId, hintId, suffix) => {
+    const pct = parseFloat(document.getElementById(inputId).value);
+    const dollars = SizingEngine.riskPctToAmount(pct, balance);
+    document.getElementById(hintId).textContent = dollars === null ? '' : `≈ ${formatMoney(dollars)}${suffix}`;
+  };
+  hint('settings-base-risk', 'hint-base-risk', ' at today\'s balance');
+  hint('settings-escalation-step', 'hint-escalation-step', ' more per confirmed win');
+  hint('settings-max-risk', 'hint-max-risk', ' at today\'s balance');
+}
+
 function renderSettingsForm() {
   document.getElementById('settings-account-name').value = currentAccount.name;
   document.getElementById('settings-starting-balance').value = currentAccount.starting_balance;
@@ -988,6 +1161,8 @@ function renderSettingsForm() {
     callout.classList.add('hidden');
     empty.classList.remove('hidden');
   }
+
+  updateSettingsDollarHints();
 }
 
 // ---------- Nav ----------
@@ -1005,8 +1180,8 @@ function wireNav() {
 // ---------- Helpers ----------
 function formatMoney(n, signed) {
   const v = Number(n) || 0;
-  const sign = signed && v > 0 ? '+' : '';
-  return `${sign}$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const sign = v < 0 ? '-' : (signed && v > 0 ? '+' : '');
+  return `${sign}$${Math.abs(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 function round2(n) { return Math.round(n * 100) / 100; }
 function showError(id, msg) { const el = document.getElementById(id); el.textContent = msg; el.classList.remove('hidden'); }

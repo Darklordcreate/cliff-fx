@@ -6,7 +6,7 @@
 <title>Cliff FX — Account Manager</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="chart.min.js"></script>
 <script src="xlsx.min.js"></script>
 <script src="supabase.min.js"></script>
@@ -48,34 +48,55 @@
 
     <!-- DASHBOARD VIEW -->
     <section id="view-dashboard" class="view">
-      <div class="stat-row stat-row-6">
-        <div class="stat-block">
-          <span class="stat-label">Balance</span>
-          <span id="stat-balance" class="stat-value">—</span>
+      <div class="hero">
+        <div>
+          <span class="hero-label">Next trade — risk</span>
+          <div id="hero-risk" class="hero-value">—</div>
+          <div id="hero-risk-hint" class="hero-hint"></div>
+          <div class="branches">
+            <div class="branch branch-win">
+              <span class="branch-name">If it wins, next risk →</span>
+              <span id="branch-win-value" class="branch-value">—</span>
+            </div>
+            <div class="branch branch-loss">
+              <span class="branch-name">If it loses, next risk →</span>
+              <span id="branch-loss-value" class="branch-value">—</span>
+            </div>
+          </div>
+          <div class="hero-hint" style="margin-top: 6px;">Dollar figures use today's balance.</div>
         </div>
-        <div class="stat-block stat-block-accent">
-          <span class="stat-label">Next trade — risk ($)</span>
-          <span id="stat-next-risk" class="stat-value">—</span>
-          <span id="stat-next-units-hint" class="stat-hint"></span>
+        <div class="hero-right">
+          <span class="strip-label">Recent results (R-multiple)</span>
+          <div id="streak-strip" class="strip"></div>
+          <div id="hero-streak" class="hero-streak"></div>
         </div>
-        <div class="stat-block">
-          <span class="stat-label">Current streak</span>
-          <span id="stat-streak" class="stat-value">—</span>
+      </div>
+
+      <div class="kpi-row">
+        <div class="kpi">
+          <span class="kpi-label">Balance</span>
+          <span id="kpi-balance" class="kpi-value">—</span>
+          <span id="kpi-balance-hint" class="kpi-hint"></span>
         </div>
-        <div class="stat-block">
-          <span class="stat-label">Realized win rate</span>
-          <span id="stat-win-rate" class="stat-value">—</span>
-          <span id="stat-win-rate-hint" class="stat-hint"></span>
+        <div class="kpi">
+          <span class="kpi-label">Drawdown</span>
+          <span id="kpi-dd" class="kpi-value">—</span>
+          <span id="kpi-dd-hint" class="kpi-hint"></span>
         </div>
-        <div class="stat-block">
-          <span class="stat-label">Realized R:R</span>
-          <span id="stat-rr" class="stat-value">—</span>
-          <span id="stat-rr-hint" class="stat-hint"></span>
+        <div class="kpi">
+          <span class="kpi-label">Win rate</span>
+          <span id="stat-win-rate" class="kpi-value">—</span>
+          <span id="stat-win-rate-hint" class="kpi-hint"></span>
         </div>
-        <div class="stat-block">
-          <span class="stat-label">Expectancy / trade</span>
-          <span id="stat-expectancy" class="stat-value">—</span>
-          <span id="stat-expectancy-hint" class="stat-hint"></span>
+        <div class="kpi">
+          <span class="kpi-label">Realized R:R</span>
+          <span id="stat-rr" class="kpi-value">—</span>
+          <span id="stat-rr-hint" class="kpi-hint"></span>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">Expectancy / trade</span>
+          <span id="stat-expectancy" class="kpi-value">—</span>
+          <span id="stat-expectancy-hint" class="kpi-hint"></span>
         </div>
       </div>
 
@@ -87,10 +108,27 @@
       <div class="panel">
         <div class="panel-header">
           <h2>Equity curve</h2>
+          <div class="chart-controls">
+            <div class="segmented" id="equity-mode">
+              <button type="button" data-mode="balance" class="active">Balance</button>
+              <button type="button" data-mode="performance">Performance %</button>
+            </div>
+            <div class="segmented" id="equity-range">
+              <button type="button" data-range="1W">1W</button>
+              <button type="button" data-range="1M">1M</button>
+              <button type="button" data-range="ALL" class="active">ALL</button>
+            </div>
+          </div>
         </div>
-        <div class="chart-wrap">
+        <div id="equity-wrap" class="chart-wrap">
           <canvas id="equity-chart"></canvas>
         </div>
+        <p id="equity-empty" class="chart-empty hidden">No trades in this range.</p>
+        <div id="dd-block">
+          <div class="strip-label" style="margin-top: 0.9rem;">Drawdown from high-water mark</div>
+          <div class="dd-wrap"><canvas id="drawdown-chart"></canvas></div>
+        </div>
+        <p id="equity-note" class="chart-note"></p>
       </div>
 
       <div class="panel">
@@ -388,6 +426,7 @@
           <div>
             <label class="field-label" for="settings-base-risk">Base risk % per trade</label>
             <input type="number" id="settings-base-risk" step="0.1" min="0.1" />
+            <span id="hint-base-risk" class="stat-hint"></span>
           </div>
         </div>
 
@@ -401,10 +440,12 @@
           <div>
             <label class="field-label" for="settings-escalation-step">Risk % increase per confirmed win</label>
             <input type="number" id="settings-escalation-step" step="0.01" min="0" />
+            <span id="hint-escalation-step" class="stat-hint"></span>
           </div>
           <div>
             <label class="field-label" for="settings-max-risk">Max risk % (cap)</label>
             <input type="number" id="settings-max-risk" step="0.1" min="0.1" />
+            <span id="hint-max-risk" class="stat-hint"></span>
           </div>
           <div>
             <label class="field-label" for="settings-pip-decimal">Default pip decimal</label>

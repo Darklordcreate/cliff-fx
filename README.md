@@ -291,6 +291,61 @@ correlate with losses"). The plan is to log real trades with this flat
 version first, then let the real data — not more speculation — drive
 what the tree and any deeper analysis should look like.
 
+## Dashboard (v11)
+
+Laid out as a hero card plus KPI cards, in the Cliff FX brand palette
+(electric teal as the single accent; muted sage/rust used only for
+win/loss; JetBrains Mono for figures). The teal in `styles.css`
+(`--accent`) is a close match — set it to the exact hex from your IG cards.
+
+- **Next trade — risk.** Dollars first, with the % and balance as context.
+  Below it, the sizer's answer *after* each outcome ("if it wins, next
+  risk → $1.69 · 2.50%", "if it loses → …") so the consequence of the next
+  trade is visible before you take it. Dollar figures use today's balance.
+- **Recent results strip.** Last 8 trades as W/L chips with their
+  R-multiple, plus a NEXT marker.
+- **KPI cards.** Balance (with peak), Drawdown (current and worst), Win
+  rate, Realized R:R, Expectancy per trade.
+- **Equity curve.** Balance or Performance %, ranges 1W / 1M / ALL, a
+  dashed high-water-mark line, deposits marked as teal dots, and a drawdown
+  strip underneath.
+- **Settings** shows every risk % as a dollar amount at today's balance.
+
+### Deposits no longer look like performance
+
+Balance jumps when you add money, which would corrupt any drawdown or
+"best balance" figure. Performance % and the drawdown strip use a
+deposit-neutral index: it starts at 100 and compounds only on each trade's
+return (P&L / balance before the trade). Deposits and credits move the
+balance but not the index.
+
+### R-multiples
+
+R = pips moved / stop distance when both are known (right for every pair,
+no pip value needed); otherwise P&L / dollars risked. Trades with no known
+stop and no risk % show `—` rather than a guess.
+
+### Imported risk % fix (non-USD-quoted pairs)
+
+The importer used `units × pip size` as the dollar value of a pip. That is
+only true when USD is the quote currency (EURUSD, GBPUSD, AUDUSD, NZDUSD).
+For USDCAD, GBPAUD and the JPY pairs it overstated risk — JPY trades showed
+hundreds of percent. The pip value is now taken from the trade itself
+(|profit| / pips moved, needs at least 3 pips), otherwise risk is left blank.
+
+**Moved stops.** An MT5 report only has the *final* stop. If it sits on the
+profit side of the entry (moved to breakeven or trailed), the original risk
+is unknown, so stop and risk are left blank and the trade is noted as such.
+Going forward the importer detects this exactly; for trades imported
+before the fix, sub-3-pip final stops were treated the same way.
+
+Existing imported rows were repaired in place (risk % and, for moved
+stops, stop distance only — P&L, balances and results untouched). The
+previous values are kept in `fx_trades_risk_repair_backup`.
+
+**Known limit:** a stop trailed *partway* (not to breakeven) can still make
+a trade's R look inflated, because the original stop isn't in the report.
+
 ## Running it
 
 This is a static site — no build step. Two options:

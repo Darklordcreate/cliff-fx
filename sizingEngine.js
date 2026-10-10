@@ -132,8 +132,8 @@ function computeRealizedStats(trades) {
   const decided = wins.length + losses.length;
 
   const winRate = decided > 0 ? wins.length / decided : null;
-  const avgWin = wins.length > 0 ? round2(wins.reduce((s, t) => s + t.pnl_amount, 0) / wins.length) : null;
-  const avgLoss = losses.length > 0 ? round2(Math.abs(losses.reduce((s, t) => s + t.pnl_amount, 0) / losses.length)) : null;
+  const avgWin = wins.length > 0 ? round2(wins.reduce((s, t) => s + Number(t.pnl_amount), 0) / wins.length) : null;
+  const avgLoss = losses.length > 0 ? round2(Math.abs(losses.reduce((s, t) => s + Number(t.pnl_amount), 0) / losses.length)) : null;
   const rewardRiskRatio = (avgWin !== null && avgLoss !== null && avgLoss > 0) ? round2(avgWin / avgLoss) : null;
 
   // Expectancy: average $ result per decided trade, accounting for both
@@ -249,7 +249,10 @@ function buildTradesFromManualRows(rows, { startTradeNumber, startingBalance }) 
  * @returns {{riskPct:number, streakType:'win'|'loss'|null, streakCount:number}}
  */
 function computeNextRisk(trades, settings) {
-  const { base_risk_pct, max_risk_pct, escalation_step_pct, loss_cut_trigger } = settings;
+  const base_risk_pct = Number(settings.base_risk_pct);
+  const max_risk_pct = Number(settings.max_risk_pct);
+  const escalation_step_pct = Number(settings.escalation_step_pct);
+  const loss_cut_trigger = Number(settings.loss_cut_trigger);
 
   if (!trades || trades.length === 0) {
     return { riskPct: base_risk_pct, streakType: null, streakCount: 0 };
@@ -278,7 +281,8 @@ function computeNextRisk(trades, settings) {
 
   if (streakType === 'loss') {
     const shouldReset = streakCount >= loss_cut_trigger;
-    const riskPct = shouldReset ? base_risk_pct : lastNonBreakevenRisk(trades) ?? base_risk_pct;
+    const lastRisk = lastNonBreakevenRisk(trades);
+    const riskPct = shouldReset ? base_risk_pct : (lastRisk !== null && lastRisk !== undefined ? Number(lastRisk) : base_risk_pct);
     return { riskPct, streakType, streakCount };
   }
 
@@ -423,6 +427,23 @@ function extractMt5PositionsRows(sheetRows) {
 }
 
 /**
+ * Risk % of the balance at entry, from the stop distance. A pip is worth
+ * units x pipSize dollars only when USD is the quote currency (EURUSD,
+ * GBPUSD...). For other pairs (USDCAD, GBPAUD, JPY crosses) the pip value
+ * is derived from the trade itself (|profit| / pips moved), which needs
+ * |pips| >= 3 to be reliable; otherwise the risk is left unknown (null)
+ * rather than shown wrong.
+ */
+function estimateRiskPct({ symbol, units, stopLossPips, pipDecimal, profit, pipsResult, balanceBefore }) {
+  if (!balanceBefore || balanceBefore <= 0 || !stopLossPips) return null;
+  let usdPerPip = null;
+  if (String(symbol).toLowerCase().endsWith('usd')) usdPerPip = units * pipDecimal;
+  else if (Math.abs(pipsResult) >= 3 && profit) usdPerPip = Math.abs(profit / pipsResult);
+  if (usdPerPip === null || !isFinite(usdPerPip) || usdPerPip <= 0) return null;
+  return round2((stopLossPips * usdPerPip / balanceBefore) * 100);
+}
+
+/**
  * Builds insertable trade rows from extracted MT5 Positions rows plus
  * balance-ledger rows (deposits/withdrawals/credits from the Deals
  * section), merged into one chronologically correct sequence.
@@ -535,11 +556,16 @@ function buildTradesFromMt5Report({ positionRows, closingDeals, adjustmentRows, 
         ? (r.priceClose - r.priceOpen) / pipDecimal
         : (r.priceOpen - r.priceClose) / pipDecimal);
 
-      if (r.sl && r.sl > 0) {
+      // The report only has the FINAL stop. If it sits at/past the entry (on
+      // the profit side) the stop was moved to breakeven or trailed, so the
+      // original risk is unknown — leave stop/risk blank instead of guessing.
+      const stopMoved = r.sl && r.sl > 0 && (r.direction === 'long' ? r.sl >= r.priceOpen : r.sl <= r.priceOpen);
+      if (r.sl && r.sl > 0 && !stopMoved) {
         stopLossPips = round2(Math.abs(r.priceOpen - r.sl) / pipDecimal);
-        if (balanceBeforeThisTrade > 0) {
-          riskPctUsed = round2((units * stopLossPips * pipDecimal) / balanceBeforeThisTrade * 100);
-        }
+        riskPctUsed = estimateRiskPct({
+          symbol: r.symbol, units, stopLossPips, pipDecimal,
+          profit: r.profit, pipsResult, balanceBefore: balanceBeforeThisTrade,
+        });
       }
     }
 
@@ -559,7 +585,7 @@ function buildTradesFromMt5Report({ positionRows, closingDeals, adjustmentRows, 
       pnl_amount: totalPnl,
       balance_after: balance,
       external_id: e.externalId,
-      notes: `Imported from MT5 report (position ${r.positionId})`,
+      notes: `Imported from MT5 report (position ${r.positionId})${pipDecimal && r.sl && r.sl > 0 && stopLossPips === null ? ' — stop was moved to breakeven/profit, original risk unknown' : ''}`,
     });
   }
 
@@ -681,6 +707,107 @@ function computeChecklistScore(checklist) {
   return { followed, total, pct: round2((followed / total) * 100) };
 }
 
+/** Deposit/credit ledger rows share the trades table but aren't trades. */
+function isLedgerRow(t) {
+  return t.pair === 'DEPOSIT' || t.pair === 'CREDIT';
+}
+
+/**
+ * R-multiple per trade: P&L divided by the dollars risked at entry
+ * (risk % x balance just before the trade). Ledger rows and trades with
+ * no recorded risk % get null rather than a guess.
+ * @returns {Array<{trade_number:number, r:number|null}>}
+ */
+function computeRMultiples(trades, startingBalance) {
+  let prevBalance = Number(startingBalance);
+  return trades.map((t) => {
+    const balanceBefore = prevBalance;
+    prevBalance = Number(t.balance_after);
+    if (isLedgerRow(t)) return { trade_number: t.trade_number, r: null };
+    // Preferred: pips moved / stop distance. Needs no pip value, so it is
+    // right for every pair (the stored risk % is not, for non-USD-quoted pairs).
+    const stop = Number(t.stop_loss_pips);
+    if (stop > 0 && t.pips_result !== null && t.pips_result !== undefined && !isNaN(Number(t.pips_result))) {
+      return { trade_number: t.trade_number, r: round2(Number(t.pips_result) / stop) };
+    }
+    // Fallback: P&L / dollars risked (trades entered in $, with no stop).
+    const riskPct = Number(t.risk_pct_used);
+    if (!riskPct || riskPct <= 0 || !balanceBefore || balanceBefore <= 0) return { trade_number: t.trade_number, r: null };
+    const riskDollars = (riskPct / 100) * balanceBefore;
+    return { trade_number: t.trade_number, r: round2(Number(t.pnl_amount) / riskDollars) };
+  });
+}
+
+/**
+ * Deposit-neutral equity series. Each point carries the account balance
+ * AND a performance index that starts at 100 and compounds only on
+ * trade returns (P&L / balance before the trade). Deposits and credits
+ * move the balance but not the index, so drawdown and return measured
+ * on the index aren't distorted by money added to the account.
+ * @returns {Array<{trade_number, trade_date, balance:number, index:number, ledger:boolean}>}
+ */
+function computeEquitySeries(trades, startingBalance) {
+  let prevBalance = Number(startingBalance);
+  let index = 100;
+  return trades.map((t) => {
+    const balanceBefore = prevBalance;
+    const balance = Number(t.balance_after);
+    prevBalance = balance;
+    const ledger = isLedgerRow(t);
+    if (!ledger && balanceBefore > 0) index = index * (1 + Number(t.pnl_amount) / balanceBefore);
+    return { trade_number: t.trade_number, trade_date: t.trade_date, balance, index: Math.round(index * 10000) / 10000, ledger };
+  });
+}
+
+/**
+ * Drawdown from the running peak of a numeric series.
+ * @param {number[]} values
+ * @returns {{drawdowns:number[], maxDrawdownPct:number, currentDrawdownPct:number}}
+ *   drawdowns are <= 0 (percent below peak); the two summary numbers are positive magnitudes.
+ */
+function computeDrawdownSeries(values) {
+  let peak = -Infinity;
+  let maxDD = 0;
+  const drawdowns = values.map((v) => {
+    if (v > peak) peak = v;
+    const d = peak > 0 ? (v / peak - 1) * 100 : 0;
+    if (-d > maxDD) maxDD = -d;
+    return round2(d);
+  });
+  const last = drawdowns.length ? drawdowns[drawdowns.length - 1] : 0;
+  return { drawdowns, maxDrawdownPct: round2(maxDD), currentDrawdownPct: round2(-last) };
+}
+
+/**
+ * Keeps points on or after a calendar cutoff ('1W' = 7 days, '1M' = 30
+ * days, 'ALL' = everything), measured back from `today` (YYYY-MM-DD).
+ */
+function sliceByRange(points, range, today) {
+  if (range === 'ALL' || !range) return points;
+  const days = range === '1W' ? 7 : range === '1M' ? 30 : null;
+  if (days === null) return points;
+  const d = new Date(`${today}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - days);
+  const cutoff = d.toISOString().slice(0, 10);
+  return points.filter((p) => String(p.trade_date) >= cutoff);
+}
+
+/**
+ * What the sizer would recommend next, and what it would recommend
+ * after a win vs after a loss — so the consequence of the next trade
+ * is visible before taking it. Dollar figures use today's balance
+ * (the real figure moves with the trade's result).
+ */
+function previewNextRisk(trades, settings, balance) {
+  const current = computeNextRisk(trades, settings);
+  const after = (result) => computeNextRisk([...trades, { result, risk_pct_used: current.riskPct }], settings);
+  const shape = (r) => ({
+    riskPct: r.riskPct, dollars: riskPctToAmount(r.riskPct, balance),
+    streakType: r.streakType, streakCount: r.streakCount,
+  });
+  return { current: shape(current), ifWin: shape(after('win')), ifLoss: shape(after('loss')) };
+}
+
 const SizingEngine = {
   suggestModelDefaults,
   computeNextRisk,
@@ -692,6 +819,13 @@ const SizingEngine = {
   riskPctToAmount,
   computeRealizedStats,
   computeStatsBySetup,
+  isLedgerRow,
+  estimateRiskPct,
+  computeRMultiples,
+  computeEquitySeries,
+  computeDrawdownSeries,
+  sliceByRange,
+  previewNextRisk,
   CHECKLIST_RULES,
   SCENARIO_OPTIONS,
   computeChecklistScore,
