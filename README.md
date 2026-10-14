@@ -346,6 +346,68 @@ previous values are kept in `fx_trades_risk_repair_backup`.
 **Known limit:** a stop trailed *partway* (not to breakeven) can still make
 a trade's R look inflated, because the original stop isn't in the report.
 
+## The Plan (v12): 10/10/20 increment model
+
+A **Plan** screen that reads your logged trades and turns the plan into
+things to follow. Start it once (Plan -> Start plan: start date, starting
+equity, target, months, split point); after that it recomputes from your
+trades every time.
+
+**The trade template.** 10-pip stop (skip the setup if structure needs more
+than 12), break-even at +10, target +20 (2R). Risk is a fixed dollar amount
+per step, so lots follow from it: $2 = 0.02 lots at a 10-pip stop, and so on.
+
+**Risk by stage** (all of this lives in `DEFAULT_PLAN` in `sizingEngine.js`,
+so changing a number or adding a stage is a config edit):
+
+| Stage | Equity | Risk per trade |
+|---|---|---|
+| Step 1-4 | under $85 / $110 / $130 / $150 | $2 / $3 / $4 / $5 |
+| Tier 2 | $150+ | 3% of equity, plus a +40-pip runner leg |
+| Tier 3 | $1,000+ | 2.5% |
+| Tier 4 | $5,000+ | 2% |
+
+**Week rule.** Goal +4R (two wins), stop at -2R, at most 4 trades. When any
+is hit the screen says STOP until Monday (weeks run Monday to Sunday, using
+the trade's date).
+
+**Moving up a step** needs the equity band AND 10 trades at the step netting
++2R or better with no rule breaks. 10 trades netting -3R or worse drop you a
+step. From Tier 2 up, equity alone decides the tier.
+
+**Rule audit.** A trade is flagged when its risk is more than 30% off the
+plan, its stop is wider than 12 pips, it was taken after the weekly stop or
+beyond 4 in a week, or its checklist is under 7/9 or its scenario is Noise or
+Counter-weekly. A trade with no checklist is counted as *unverified*, not as
+a break, so bulk-imported trades don't block progress. A flagged trade in the
+last 10 blocks a step-up.
+
+**The road and pace.** A stage list showing where you are, and a chart of your
+deposit-neutral equity against the straight-line (constant monthly growth)
+path to the target. Deposits never count as progress. If you fall behind, the
+screen says to extend the date, not to raise the risk.
+
+**Pip value.** The next-trade ticket has a pip-value field (dollars per pip per
+1.00 lot; 10 for USD-quoted pairs). For other pairs read it from MT5 (Market
+Watch -> Specification -> tick value). The older "Suggested units" field on the
+Log a trade form still assumes a USD quote, so use the Plan ticket for lots.
+
+When a plan is running, the Dashboard's next-trade card and the Log a trade
+form use the plan's risk and show the stop signal.
+
+**Checkpoint correction.** The path to exactly $10,000 from $67 over 12
+months is $102, $154, $234, $355, $539, $819, $1,242, $1,885, $2,861, $4,342,
+$6,589, $10,000 (month by month, +51.8% a month). The Plan screen computes
+this from your start equity and target.
+
+**Dates.** The app now uses your local date, not the UTC date. Between
+midnight and 03:00 in Kenya they differ, which would have put a trade on the
+wrong day and the weekly meter in the wrong week.
+
+**Not built yet:** the smoothing rules (open-risk reduction after win streaks
+and after losses), an action at the split point, setup-leg grouping, and the
+MT5 connector.
+
 ## Running it
 
 This is a static site — no build step. Two options:

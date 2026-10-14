@@ -28,6 +28,7 @@
     <div class="brand-mark">Cliff FX</div>
     <nav class="nav">
       <button class="nav-item active" data-view="dashboard">Dashboard</button>
+      <button class="nav-item" data-view="plan">Plan</button>
       <button class="nav-item" data-view="trade-log">Trade log</button>
       <button class="nav-item" data-view="settings">Settings</button>
     </nav>
@@ -55,11 +56,11 @@
           <div id="hero-risk-hint" class="hero-hint"></div>
           <div class="branches">
             <div class="branch branch-win">
-              <span class="branch-name">If it wins, next risk →</span>
+              <span id="branch-win-name" class="branch-name">If it wins, next risk →</span>
               <span id="branch-win-value" class="branch-value">—</span>
             </div>
             <div class="branch branch-loss">
-              <span class="branch-name">If it loses, next risk →</span>
+              <span id="branch-loss-name" class="branch-name">If it loses, next risk →</span>
               <span id="branch-loss-value" class="branch-value">—</span>
             </div>
           </div>
@@ -165,6 +166,108 @@
           <p id="recent-trades-empty" class="empty-hint hidden">No trades logged yet.</p>
         </div>
       </div>
+    </section>
+
+    <!-- PLAN VIEW -->
+    <section id="view-plan" class="view hidden">
+
+      <div id="plan-config" class="panel">
+        <div class="panel-header">
+          <h2 id="plan-config-title">Start your plan</h2>
+          <span class="panel-note">10/10/20 increment model</span>
+        </div>
+        <p id="plan-config-intro" class="panel-note" style="margin: 0 0 0.9rem;">
+          The plan reads your logged trades from the start date. It tells you the risk for the next trade,
+          when to stop for the week, which step you're on, and whether you're on pace for the target.
+        </p>
+        <div class="form-grid">
+          <div>
+            <label class="field-label" for="plan-start-date">Start date</label>
+            <input type="date" id="plan-start-date" />
+          </div>
+          <div>
+            <label class="field-label" for="plan-start-equity">Starting equity ($)</label>
+            <input type="number" id="plan-start-equity" step="0.01" min="1" />
+          </div>
+          <div>
+            <label class="field-label" for="plan-target">Target ($)</label>
+            <input type="number" id="plan-target" step="100" min="100" />
+          </div>
+          <div>
+            <label class="field-label" for="plan-months">Months to target</label>
+            <input type="number" id="plan-months" step="1" min="1" max="60" />
+          </div>
+          <div>
+            <label class="field-label" for="plan-split">Split the account at ($)</label>
+            <input type="number" id="plan-split" step="100" min="0" />
+          </div>
+        </div>
+        <p id="plan-error" class="form-error hidden"></p>
+        <div style="margin-top: 1rem; display: flex; gap: 8px; flex-wrap: wrap;">
+          <button id="plan-save-btn" type="button" class="btn btn-primary">Start plan</button>
+          <button id="plan-restart-btn" type="button" class="btn btn-ghost hidden">Restart from today</button>
+        </div>
+      </div>
+
+      <div id="plan-body" class="hidden">
+        <div id="plan-signal" class="signal"></div>
+
+        <div class="plan-grid">
+          <div class="panel">
+            <div class="panel-header"><h2>Next trade</h2><span id="ticket-stage" class="panel-note"></span></div>
+            <div class="ticket">
+              <div class="ticket-cell"><span class="strip-label">Risk</span><span id="ticket-risk" class="ticket-value">—</span><span id="ticket-risk-hint" class="kpi-hint"></span></div>
+              <div class="ticket-cell"><span class="strip-label">Lots</span><span id="ticket-lots" class="ticket-value">—</span><span id="ticket-lots-hint" class="kpi-hint"></span></div>
+              <div class="ticket-cell"><span class="strip-label">Stop</span><span id="ticket-stop" class="ticket-value">—</span><span id="ticket-stop-hint" class="kpi-hint"></span></div>
+              <div class="ticket-cell"><span class="strip-label">Break-even</span><span id="ticket-be" class="ticket-value">—</span><span class="kpi-hint">move the stop to entry</span></div>
+              <div class="ticket-cell"><span class="strip-label">Target</span><span id="ticket-target" class="ticket-value">—</span><span id="ticket-target-hint" class="kpi-hint"></span></div>
+              <div class="ticket-cell"><span class="strip-label">Win / loss</span><span id="ticket-pl" class="ticket-value">—</span><span class="kpi-hint">at the planned risk</span></div>
+            </div>
+            <div class="pipvalue-row">
+              <label class="field-label" for="plan-pip-value" style="margin: 0;">Pip value ($ per pip per 1.00 lot)</label>
+              <input type="number" id="plan-pip-value" step="0.1" min="0.1" value="10" />
+              <span class="kpi-hint">10 for EURUSD, GBPUSD, AUDUSD, NZDUSD. For other pairs, read it from MT5 (Market Watch → Specification → tick value).</span>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header"><h2>This week</h2><span id="week-label" class="panel-note"></span></div>
+            <div id="week-net" class="week-net">—</div>
+            <div class="meter">
+              <div id="week-meter-fill" class="meter-fill"></div>
+              <div id="week-meter-zero" class="meter-zero"></div>
+            </div>
+            <div class="meter-labels"><span id="week-cap-label"></span><span id="week-goal-label"></span></div>
+            <div id="week-detail" class="kpi-hint" style="margin-top: 0.6rem;"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><h2>The road</h2><span class="panel-note">Your equity decides the stage; the plan decides the rules</span></div>
+          <div id="road" class="road"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><h2 id="gate-title">Next step</h2><span id="gate-note" class="panel-note"></span></div>
+          <div id="gate-slots" class="strip"></div>
+          <ul id="gate-reqs" class="reqs"></ul>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><h2>Pace to target</h2><span id="pace-note" class="panel-note"></span></div>
+          <div id="pace-status" class="pace-status"></div>
+          <div class="chart-wrap"><canvas id="plan-pace-chart"></canvas></div>
+          <p class="chart-note">Pace ignores deposits. The y-axis is logarithmic, so steady monthly growth is a straight line.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><h2>Weeks &amp; rule audit</h2><span id="audit-note" class="panel-note"></span></div>
+          <div class="strip-label" style="margin-bottom: 6px;">Recent weeks (R banked)</div>
+          <div id="week-strip" class="strip"></div>
+          <ul id="audit-list" class="audit"></ul>
+        </div>
+      </div>
+
     </section>
 
     <!-- TRADE LOG VIEW -->

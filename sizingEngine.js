@@ -808,6 +808,289 @@ function previewNextRisk(trades, settings, balance) {
   return { current: shape(current), ifWin: shape(after('win')), ifLoss: shape(after('loss')) };
 }
 
+/* ===================================================================
+ * THE PLAN — "10/10/20 increment model"
+ * All rules live in DEFAULT_PLAN as data, so adding smoothing rules or new
+ * stages later is a config change, not a rewrite.
+ * =================================================================== */
+const DEFAULT_PLAN = {
+  version: 1,
+  start_date: null,        // YYYY-MM-DD, set when the plan is started
+  start_equity: null,      // balance when the plan started
+  target: 10000,
+  months: 12,
+  split_at: 2000,          // equity at which the account is split (a road milestone)
+  // The trade template: 10-pip stop, break-even at +10, target +20 (2R).
+  trade: {
+    stopPips: 10, bePips: 10, targetPips: 20, runnerTargetPips: 40,
+    maxStopPips: 12, maxTradesPerWeek: 4, weeklyGoalR: 4, weeklyCapR: -2,
+  },
+  // Tier 1: fixed-dollar risk steps, each tied to an equity band.
+  steps: [
+    { id: 'S1', label: 'Step 1', risk: 2, equityTo: 85 },
+    { id: 'S2', label: 'Step 2', risk: 3, equityTo: 110 },
+    { id: 'S3', label: 'Step 3', risk: 4, equityTo: 130 },
+    { id: 'S4', label: 'Step 4', risk: 5, equityTo: 150 },
+  ],
+  // To move up a step: equity band AND this many trades netting minNetR with no rule breaks.
+  // Drop a step if that many trades net dropNetR or worse.
+  stepGate: { trades: 10, minNetR: 2, dropNetR: -3 },
+  // Tier 2+: risk is a percent of equity (and the swing runner leg is added).
+  tiers: [
+    { id: 'T2', label: 'Tier 2', equityFrom: 150, riskPct: 3, runner: true },
+    { id: 'T3', label: 'Tier 3', equityFrom: 1000, riskPct: 2.5, runner: true },
+    { id: 'T4', label: 'Tier 4', equityFrom: 5000, riskPct: 2, runner: true },
+  ],
+  rules: { riskTolerancePct: 30, minChecklist: 7, blockedScenarios: ['noise', 'counter_weekly'] },
+};
+
+/** Merges a saved plan (partial) over the defaults. */
+function mergePlan(saved) {
+  const p = saved || {};
+  const d = DEFAULT_PLAN;
+  return {
+    ...d, ...p,
+    trade: { ...d.trade, ...(p.trade || {}) },
+    stepGate: { ...d.stepGate, ...(p.stepGate || {}) },
+    rules: { ...d.rules, ...(p.rules || {}) },
+    steps: p.steps || d.steps,
+    tiers: p.tiers || d.tiers,
+  };
+}
+
+/** Monday of the week containing dateStr (YYYY-MM-DD), as YYYY-MM-DD. */
+function weekStartOf(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  const offset = (d.getUTCDay() + 6) % 7; // Monday = 0
+  d.setUTCDate(d.getUTCDate() - offset);
+  return d.toISOString().slice(0, 10);
+}
+
+function addMonthsISO(dateStr, k) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + k, d.getUTCDate())).toISOString().slice(0, 10);
+}
+
+/**
+ * Lot size for a dollar risk. pipValuePerLot is dollars per pip per 1.00 lot
+ * (10 for USD-quoted pairs like EURUSD; other pairs differ — read it from MT5).
+ * Rounds DOWN to 0.01 so the real risk never exceeds the plan. With runner=true
+ * and at least 0.02 lots, splits into a +20 leg (legA) and a runner (legB).
+ */
+function lotsForRisk({ riskDollars, stopPips, pipValuePerLot = 10, runner = false }) {
+  const perLot = stopPips * pipValuePerLot;
+  const raw = perLot > 0 ? riskDollars / perLot : 0;
+  const total = Math.max(0.01, Math.floor(raw * 100 + 1e-9) / 100);
+  const riskActual = round2(total * perLot);
+  if (!runner || total < 0.02) return { total, riskActual, legA: total, legB: 0 };
+  const legB = Math.floor(total * 100 / 2) / 100;
+  return { total, riskActual, legA: round2(total - legB), legB };
+}
+
+function planMaxStepIndex(plan, equity) {
+  const i = plan.steps.findIndex((s) => equity < s.equityTo);
+  return i === -1 ? plan.steps.length - 1 : i;
+}
+
+/** Which stage applies for the NEXT trade, given equity and the earned step. */
+function planStage(plan, equity, stepIdx) {
+  const tiers = plan.tiers;
+  if (tiers.length && equity >= tiers[0].equityFrom) {
+    let t = tiers[0];
+    for (const x of tiers) if (equity >= x.equityFrom) t = x;
+    return { kind: 'tier', ...t };
+  }
+  const idx = Math.min(stepIdx, planMaxStepIndex(plan, equity));
+  return { kind: 'step', ...plan.steps[idx], index: idx };
+}
+
+function planRiskDollars(stage, equity) {
+  return stage.kind === 'step' ? stage.risk : round2((stage.riskPct / 100) * equity);
+}
+
+const usd = (v) => `$${Number(v).toFixed(2)}`;
+const usd0 = (v) => `$${Number(v).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+
+/**
+ * Replays the logged trades through the plan and returns everything the Plan
+ * screen shows: current stage and ticket, this week's meter and stop signal,
+ * the step gate, the road, pace against the target path, and a rule audit.
+ *
+ * Only real trades on/after plan.start_date count (ledger rows never do).
+ * Pace is deposit-neutral: it follows the performance index, not the balance.
+ */
+function evaluatePlan(trades, startingBalance, planIn, today) {
+  const plan = mergePlan(planIn);
+  if (!plan.start_date || !plan.start_equity) return { started: false, plan };
+
+  const tr = plan.trade, gate = plan.stepGate, rules = plan.rules;
+  const rs = computeRMultiples(trades, startingBalance);
+  const series = computeEquitySeries(trades, startingBalance);
+  let prevBal = Number(startingBalance);
+  const rows = trades.map((t, i) => {
+    const before = prevBal;
+    prevBal = Number(t.balance_after);
+    return { t, before, after: prevBal, r: rs[i].r, idx: series[i].index };
+  });
+  const planRows = rows.filter((x) => !isLedgerRow(x.t) && String(x.t.trade_date) >= plan.start_date);
+  const tierStart = plan.tiers.length ? plan.tiers[0].equityFrom : Infinity;
+
+  let stepIdx = 0, stepTrades = [];
+  let weekKey = null, weekR = 0, weekCount = 0, weekStop = null;
+  const weeks = [];
+  const pushWeek = () => {
+    if (!weekKey) return;
+    weeks.push({ weekStart: weekKey, trades: weekCount, netR: round2(weekR),
+      outcome: weekStop || (weekCount >= tr.maxTradesPerWeek ? 'limit' : 'open') });
+  };
+  const audit = { planTrades: planRows.length, clean: 0, flagged: 0, unverified: 0, noR: 0, flags: [] };
+
+  for (const x of planRows) {
+    const wk = weekStartOf(x.t.trade_date);
+    if (wk !== weekKey) { pushWeek(); weekKey = wk; weekR = 0; weekCount = 0; weekStop = null; }
+
+    const stage = planStage(plan, x.before, stepIdx);
+    const planned = planRiskDollars(stage, x.before);
+    const flags = [];
+
+    if (x.t.risk_pct_used !== null && x.t.risk_pct_used !== undefined && planned > 0) {
+      const actual = (Number(x.t.risk_pct_used) / 100) * x.before;
+      if (Math.abs(actual - planned) / planned > rules.riskTolerancePct / 100) flags.push(`risk ${usd(actual)} vs plan ${usd(planned)}`);
+    }
+    if (x.t.stop_loss_pips !== null && x.t.stop_loss_pips !== undefined && Number(x.t.stop_loss_pips) > tr.maxStopPips) {
+      flags.push(`stop ${Number(x.t.stop_loss_pips)} pips (max ${tr.maxStopPips})`);
+    }
+    if (weekStop) flags.push('taken after the weekly stop');
+    else if (weekCount >= tr.maxTradesPerWeek) flags.push(`more than ${tr.maxTradesPerWeek} trades this week`);
+    if (x.t.checklist) {
+      const sc = computeChecklistScore(x.t.checklist);
+      if (sc && sc.followed < rules.minChecklist) flags.push(`checklist ${sc.followed}/${sc.total}`);
+      if ((rules.blockedScenarios || []).includes(x.t.checklist.scenario)) flags.push(`scenario: ${x.t.checklist.scenario}`);
+    } else {
+      audit.unverified++;
+    }
+
+    if (x.r === null) audit.noR++;
+    if (flags.length) { audit.flagged++; audit.flags.push({ trade_number: x.t.trade_number, pair: x.t.pair, reasons: flags }); } else audit.clean++;
+
+    weekR += x.r ?? 0;
+    weekCount++;
+    if (!weekStop) { if (weekR >= tr.weeklyGoalR) weekStop = 'goal'; else if (weekR <= tr.weeklyCapR) weekStop = 'cap'; }
+
+    stepTrades.push({ r: x.r ?? 0, clean: flags.length === 0, trade_number: x.t.trade_number });
+    if (x.after < tierStart) {
+      const maxIdx = planMaxStepIndex(plan, x.after);
+      if (stepIdx > maxIdx) { stepIdx = maxIdx; stepTrades = []; }
+      else if (stepTrades.length >= gate.trades) {
+        const last = stepTrades.slice(-gate.trades);
+        const net = last.reduce((a, c) => a + c.r, 0);
+        if (stepIdx < maxIdx && net >= gate.minNetR && last.every((c) => c.clean)) { stepIdx++; stepTrades = []; }
+        else if (net <= gate.dropNetR && stepIdx > 0) { stepIdx--; stepTrades = []; }
+      }
+    } else {
+      stepTrades = [];
+    }
+  }
+  pushWeek();
+
+  // ----- current state -----
+  const equityNow = rows.length ? rows[rows.length - 1].after : Number(startingBalance);
+  const stage = planStage(plan, equityNow, stepIdx);
+  const riskNow = planRiskDollars(stage, equityNow);
+  const sameWeek = weekKey === weekStartOf(today);
+  const wk = sameWeek ? { trades: weekCount, netR: round2(weekR), stop: weekStop } : { trades: 0, netR: 0, stop: null };
+  const weekStatus = wk.stop || (wk.trades >= tr.maxTradesPerWeek ? 'limit' : 'open');
+
+  const ticket = {
+    riskDollars: riskNow,
+    riskPct: equityNow > 0 ? round2((riskNow / equityNow) * 100) : null,
+    stopPips: tr.stopPips, bePips: tr.bePips, targetPips: tr.targetPips,
+    runnerTargetPips: stage.runner ? tr.runnerTargetPips : null,
+    winDollars: round2(riskNow * (tr.targetPips / tr.stopPips)),
+    weeklyGoalDollars: round2(tr.weeklyGoalR * riskNow),
+    weeklyCapDollars: round2(tr.weeklyCapR * riskNow),
+    runner: !!stage.runner,
+  };
+
+  // ----- step gate -----
+  let gateInfo = null;
+  if (stage.kind === 'step') {
+    const last = stepTrades.slice(-gate.trades);
+    const netR = round2(last.reduce((a, c) => a + c.r, 0));
+    const allClean = last.every((c) => c.clean);
+    const bandEnd = plan.steps[stage.index].equityTo;
+    const isLast = stage.index === plan.steps.length - 1;
+    const requirements = isLast
+      ? [{ label: `Equity at or above ${usd0(bandEnd)} (Tier 2)`, ok: equityNow >= bandEnd, detail: usd(equityNow) }]
+      : [
+          { label: `Equity at or above ${usd0(bandEnd)}`, ok: equityNow >= bandEnd, detail: usd(equityNow) },
+          { label: `${gate.trades} trades at this step`, ok: stepTrades.length >= gate.trades, detail: `${Math.min(stepTrades.length, gate.trades)}/${gate.trades}` },
+          { label: `Net ${gate.minNetR >= 0 ? '+' : ''}${gate.minNetR}R over the last ${gate.trades}`, ok: stepTrades.length >= gate.trades && netR >= gate.minNetR, detail: `${netR >= 0 ? '+' : ''}${netR}R` },
+          { label: `No rule breaks in the last ${gate.trades}`, ok: allClean, detail: allClean ? 'clean' : 'a flagged trade' },
+        ];
+    gateInfo = {
+      from: stage.label, to: isLast ? 'Tier 2' : plan.steps[stage.index + 1].label,
+      slots: Array.from({ length: gate.trades }, (_, i) => last[i] || null),
+      netR, requirements, isLast,
+      equityReady: equityNow >= bandEnd,
+    };
+  }
+
+  // ----- the road -----
+  let from = 0;
+  const road = [];
+  plan.steps.forEach((s) => {
+    road.push({ id: s.id, kind: 'step', label: s.label, from, to: s.equityTo,
+      rule: `Risk ${usd0(s.risk)} per trade`,
+      detail: `Week: +${tr.weeklyGoalR}R = +${usd0(tr.weeklyGoalR * s.risk)} · stop at ${tr.weeklyCapR}R = −${usd0(Math.abs(tr.weeklyCapR) * s.risk)}` });
+    from = s.equityTo;
+  });
+  plan.tiers.forEach((t, i) => {
+    const to = i + 1 < plan.tiers.length ? plan.tiers[i + 1].equityFrom : plan.target;
+    road.push({ id: t.id, kind: 'tier', label: t.label, from: t.equityFrom, to,
+      rule: `Risk ${t.riskPct}% of equity`, detail: t.runner ? `Two legs: +${tr.targetPips} pips and a +${tr.runnerTargetPips} pip runner` : '' });
+  });
+  if (plan.split_at) road.push({ id: 'SPLIT', kind: 'milestone', label: 'Split the account', from: plan.split_at, to: plan.split_at, rule: usd0(plan.split_at), detail: '' });
+  road.push({ id: 'GOAL', kind: 'goal', label: 'Goal', from: plan.target, to: plan.target, rule: usd0(plan.target), detail: '' });
+  road.sort((a, b) => a.from - b.from || (a.kind === 'milestone' || a.kind === 'goal' ? 1 : -1) - (b.kind === 'milestone' || b.kind === 'goal' ? 1 : -1));
+  const currentPos = road.findIndex((r) => r.id === stage.id);
+  road.forEach((r, i) => {
+    if (r.kind === 'milestone' || r.kind === 'goal') { r.status = equityNow >= r.from ? 'done' : 'upcoming'; return; }
+    r.status = i < currentPos ? 'done' : i === currentPos ? 'current' : 'upcoming';
+    r.progress = r.to > r.from ? Math.max(0, Math.min(1, (equityNow - r.from) / (r.to - r.from))) : 1;
+  });
+
+  // ----- pace (deposit-neutral) -----
+  const startMs = Date.parse(`${plan.start_date}T00:00:00Z`);
+  const elapsedMonths = Math.max(0, (Date.parse(`${today}T00:00:00Z`) - startMs) / (30.4375 * 86400000));
+  const g = Math.pow(plan.target / plan.start_equity, 1 / plan.months);
+  let idxStart = 100;
+  for (let i = 0; i < trades.length; i++) { if (String(trades[i].trade_date) < plan.start_date) idxStart = series[i].index; }
+  const idxNow = series.length ? series[series.length - 1].index : 100;
+  const adjusted = plan.start_equity * (idxNow / idxStart);
+  const expected = plan.start_equity * Math.pow(g, elapsedMonths);
+  const ratio = expected > 0 ? adjusted / expected : 1;
+  const monthsAt = adjusted > 0 ? Math.log(adjusted / plan.start_equity) / Math.log(g) : 0;
+  const path = Array.from({ length: plan.months + 1 }, (_, k) => ({ month: k, date: addMonthsISO(plan.start_date, k), equity: round2(plan.start_equity * Math.pow(g, k)) }));
+  const actual = [{ x: 0, y: round2(plan.start_equity) }].concat(planRows.map((x) => ({
+    x: Math.round(((Date.parse(`${x.t.trade_date}T00:00:00Z`) - startMs) / (30.4375 * 86400000)) * 100) / 100,
+    y: round2(plan.start_equity * (x.idx / idxStart)),
+  })));
+  const pace = {
+    adjustedEquity: round2(adjusted), expectedEquity: round2(expected), ratio: round2(ratio),
+    monthsAhead: round2(monthsAt - elapsedMonths), elapsedMonths: round2(elapsedMonths),
+    monthlyGrowthPct: round2((g - 1) * 100),
+    status: ratio >= 0.95 ? 'on' : ratio >= 0.7 ? 'behind' : 'far',
+    path, actual,
+  };
+
+  return {
+    started: true, plan, equityNow, stage, stepIndex: stepIdx, ticket,
+    week: { start: weekStartOf(today), ...wk, status: weekStatus, goalR: tr.weeklyGoalR, capR: tr.weeklyCapR, maxTrades: tr.maxTradesPerWeek },
+    gate: gateInfo, road, pace, weeks: weeks.slice(-10), audit,
+  };
+}
+
 const SizingEngine = {
   suggestModelDefaults,
   computeNextRisk,
@@ -826,6 +1109,11 @@ const SizingEngine = {
   computeDrawdownSeries,
   sliceByRange,
   previewNextRisk,
+  DEFAULT_PLAN,
+  mergePlan,
+  weekStartOf,
+  lotsForRisk,
+  evaluatePlan,
   CHECKLIST_RULES,
   SCENARIO_OPTIONS,
   computeChecklistScore,

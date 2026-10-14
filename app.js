@@ -7,6 +7,8 @@ let currentSettings = null;
 let currentTrades = [];
 let equityChart = null;
 let drawdownChart = null;
+let currentPlanState = null;   // result of SizingEngine.evaluatePlan for the selected account
+let planPaceChart = null;
 let equityMode = 'balance';   // 'balance' | 'performance'
 let equityRange = 'ALL';      // '1W' | '1M' | 'ALL'
 
@@ -29,6 +31,7 @@ async function init() {
   wireQuickAddGrid();
   wireXlsxImportPanel();
   wireChartControls();
+  wirePlan();
 
   // This page (app.html) only ever renders authenticated content. If
   // there's no session — direct navigation, a stale bookmark, whatever —
@@ -158,7 +161,10 @@ async function selectAccount(accountId) {
   // Each section renders independently — a failure in one (e.g. a
   // blocked chart library) must never prevent the others from showing,
   // and especially must never hide that a trade actually did save.
+  try { currentPlanState = computePlanState(); } catch (err) { console.error('Plan evaluation failed:', err); currentPlanState = null; }
+
   runSafely('settings form', renderSettingsForm);
+  runSafely('plan', renderPlan);
   runSafely('dashboard', renderDashboard);
   runSafely('trade log', renderTradeLog);
 }
@@ -201,23 +207,54 @@ function streakLabel(type, count) {
   return `${count} ${word}`;
 }
 
+/** Hero card when a plan is running: the plan's risk, this week's meter, and the stop signal. */
+function renderHeroFromPlan(plan, balance) {
+  const t = plan.ticket;
+  const w = plan.week;
+  const riskEl = document.getElementById('hero-risk');
+  const stopped = w.status !== 'open';
+
+  riskEl.textContent = stopped ? 'STOP' : formatMoney(t.riskDollars);
+  riskEl.style.color = stopped ? 'var(--loss)' : '';
+  document.getElementById('hero-risk-hint').textContent = stopped
+    ? (w.status === 'goal' ? 'Weekly goal reached — you are done until Monday'
+      : w.status === 'cap' ? 'Weekly cap hit — protect the account until Monday'
+      : `${w.maxTrades} trades taken — you are done until Monday`)
+    : `Plan · ${plan.stage.label} · ${t.riskPct}% of ${formatMoney(balance)} · stop ${t.stopPips} / BE +${t.bePips} / target +${t.targetPips}`;
+
+  document.getElementById('branch-win-name').textContent = 'This week so far →';
+  document.getElementById('branch-win-value').textContent = `${fmtR(w.netR)} of +${w.goalR}R goal`;
+  document.getElementById('branch-loss-name').textContent = 'Stop for the week at →';
+  document.getElementById('branch-loss-value').textContent = `${w.capR}R (−${formatMoney(Math.abs(t.weeklyCapDollars))})`;
+
+  document.getElementById('hero-streak').textContent = `${w.trades} of ${w.maxTrades} trades this week`;
+}
+
 /** Next-trade card: dollar risk first, what happens after a win vs a loss, and the recent R strip. */
 function renderHero() {
   const balance = currentBalance();
-  const preview = SizingEngine.previewNextRisk(currentTrades, currentSettings, balance);
-  const cur = preview.current;
+  const plan = currentPlanState && currentPlanState.started ? currentPlanState : null;
 
-  document.getElementById('hero-risk').textContent = cur.dollars !== null ? formatMoney(cur.dollars) : `${cur.riskPct.toFixed(2)}%`;
-  document.getElementById('hero-risk-hint').textContent =
-    `${cur.riskPct.toFixed(2)}% of ${formatMoney(balance)} — what you lose if the stop is hit`;
+  if (plan) {
+    renderHeroFromPlan(plan, balance);
+  } else {
+    const preview = SizingEngine.previewNextRisk(currentTrades, currentSettings, balance);
+    const cur = preview.current;
+    document.getElementById('hero-risk').textContent = cur.dollars !== null ? formatMoney(cur.dollars) : `${cur.riskPct.toFixed(2)}%`;
+    document.getElementById('hero-risk').style.color = '';
+    document.getElementById('hero-risk-hint').textContent =
+      `${cur.riskPct.toFixed(2)}% of ${formatMoney(balance)} — what you lose if the stop is hit`;
 
-  const branchText = (b) => (b.dollars !== null ? `${formatMoney(b.dollars)} · ${b.riskPct.toFixed(2)}%` : `${b.riskPct.toFixed(2)}%`);
-  document.getElementById('branch-win-value').textContent = branchText(preview.ifWin);
-  document.getElementById('branch-loss-value').textContent = branchText(preview.ifLoss);
+    const branchText = (b) => (b.dollars !== null ? `${formatMoney(b.dollars)} · ${b.riskPct.toFixed(2)}%` : `${b.riskPct.toFixed(2)}%`);
+    document.getElementById('branch-win-name').textContent = 'If it wins, next risk →';
+    document.getElementById('branch-loss-name').textContent = 'If it loses, next risk →';
+    document.getElementById('branch-win-value').textContent = branchText(preview.ifWin);
+    document.getElementById('branch-loss-value').textContent = branchText(preview.ifLoss);
 
-  document.getElementById('hero-streak').textContent = cur.streakType
-    ? `Current run: ${streakLabel(cur.streakType, cur.streakCount)} in a row`
-    : 'No run yet';
+    document.getElementById('hero-streak').textContent = cur.streakType
+      ? `Current run: ${streakLabel(cur.streakType, cur.streakCount)} in a row`
+      : 'No run yet';
+  }
 
   // Recent results as R-multiples (deposits/credits aren't trades).
   const rs = SizingEngine.computeRMultiples(currentTrades, currentAccount.starting_balance);
@@ -354,7 +391,7 @@ function renderEquityChart() {
 
   const start = Number(currentAccount.starting_balance);
   const all = SizingEngine.computeEquitySeries(currentTrades, start);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayLocalISO();
   const points = SizingEngine.sliceByRange(all, equityRange, today);
   const hasData = points.length > 0;
 
@@ -459,6 +496,348 @@ function renderEquityChart() {
     : `Balance includes money you add${hasLedger ? ' (teal dots mark deposits and credits)' : ''}. The drawdown strip below ignores deposits, so adding money never looks like recovery.`;
 }
 
+// ---------- Plan screen ----------
+function todayLocalISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function fmtR(v) {
+  const n = Number(v) || 0;
+  return `${n > 0 ? '+' : ''}${n.toFixed(1)}R`;
+}
+
+function fmtDay(iso) {
+  return new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+}
+
+function computePlanState() {
+  const saved = currentSettings && currentSettings.plan ? currentSettings.plan : null;
+  return SizingEngine.evaluatePlan(currentTrades, Number(currentAccount.starting_balance), saved, todayLocalISO());
+}
+
+function renderPlan() {
+  const st = currentPlanState;
+  const view = document.getElementById('view-plan');
+  const cfg = document.getElementById('plan-config');
+  const body = document.getElementById('plan-body');
+  const started = !!(st && st.started);
+
+  fillPlanConfigForm(started ? st.plan : null);
+  setPlanConfigMode(started ? 'edit' : 'start');
+  // Not started: the form leads the page. Started: it moves to the bottom as settings.
+  if (started) view.appendChild(cfg); else view.insertBefore(cfg, body);
+  body.classList.toggle('hidden', !started);
+  if (!started) return;
+
+  runSafely('plan signal', () => renderPlanSignal(st));
+  runSafely('plan ticket', () => renderPlanTicket(st));
+  runSafely('plan week', () => renderPlanWeek(st));
+  runSafely('plan road', () => renderPlanRoad(st));
+  runSafely('plan gate', () => renderPlanGate(st));
+  runSafely('plan pace', () => renderPlanPace(st));
+  runSafely('plan audit', () => renderPlanAudit(st));
+}
+
+function fillPlanConfigForm(plan) {
+  const d = SizingEngine.DEFAULT_PLAN;
+  document.getElementById('plan-start-date').value = (plan && plan.start_date) || todayLocalISO();
+  document.getElementById('plan-start-equity').value = (plan && plan.start_equity) || round2(currentBalance());
+  document.getElementById('plan-target').value = (plan && plan.target) || d.target;
+  document.getElementById('plan-months').value = (plan && plan.months) || d.months;
+  document.getElementById('plan-split').value = plan ? (plan.split_at || '') : d.split_at;
+}
+
+function setPlanConfigMode(mode) {
+  const edit = mode === 'edit';
+  document.getElementById('plan-config-title').textContent = edit ? 'Plan settings' : 'Start your plan';
+  document.getElementById('plan-config-intro').classList.toggle('hidden', edit);
+  document.getElementById('plan-save-btn').textContent = edit ? 'Save settings' : 'Start plan';
+  document.getElementById('plan-restart-btn').classList.toggle('hidden', !edit);
+}
+
+async function savePlanConfig(restart) {
+  hideError('plan-error');
+  const startDate = document.getElementById('plan-start-date').value;
+  const startEquity = parseFloat(document.getElementById('plan-start-equity').value);
+  const target = parseFloat(document.getElementById('plan-target').value);
+  const months = parseInt(document.getElementById('plan-months').value, 10);
+  const split = parseFloat(document.getElementById('plan-split').value);
+
+  if (!restart && !startDate) return showError('plan-error', 'Choose a start date.');
+  if (!restart && (!startEquity || startEquity <= 0)) return showError('plan-error', 'Enter the starting equity.');
+  if (!target || target <= 0) return showError('plan-error', 'Enter a target.');
+  if (!months || months < 1 || months > 60) return showError('plan-error', 'Months to target must be between 1 and 60.');
+  if (restart && !confirm('Restart the plan from today? The step count and weekly meter start over; your logged trades are kept.')) return;
+
+  const base = restart ? round2(currentBalance()) : startEquity;
+  if (target <= base) return showError('plan-error', 'The target must be above the starting equity.');
+
+  const existing = (currentSettings && currentSettings.plan) || {};
+  const plan = {
+    ...existing,
+    start_date: restart ? todayLocalISO() : startDate,
+    start_equity: base,
+    target, months,
+    split_at: isNaN(split) || split <= 0 ? null : split,
+  };
+  const { error } = await supa.from('fx_model_settings').update({ plan }).eq('account_id', currentAccount.id);
+  if (error) return showError('plan-error', error.message);
+
+  await selectAccount(currentAccount.id);
+  showToast(restart ? 'Plan restarted from today.' : 'Plan saved.');
+}
+
+function renderPlanSignal(st) {
+  const w = st.week;
+  const t = st.ticket;
+  const el = document.getElementById('plan-signal');
+  let cls, head, sub;
+  if (w.status === 'goal') {
+    cls = 'signal-ok'; head = 'Weekly goal reached — stop for the week';
+    sub = `You banked ${fmtR(w.netR)} (goal +${w.goalR}R). The next trade is Monday.`;
+  } else if (w.status === 'cap') {
+    cls = 'signal-stop'; head = 'Weekly cap hit — stop for the week';
+    sub = `${fmtR(w.netR)} (cap ${w.capR}R). Protect the account; the next trade is Monday.`;
+  } else if (w.status === 'limit') {
+    cls = 'signal-warn'; head = `${w.maxTrades} trades taken — stop for the week`;
+    sub = `You're at ${fmtR(w.netR)} for the week. The next trade is Monday.`;
+  } else {
+    cls = 'signal-go'; head = 'You can take a trade';
+    const left = w.maxTrades - w.trades;
+    sub = `${st.stage.label} · risk ${formatMoney(t.riskDollars)} · ${left} trade${left === 1 ? '' : 's'} left this week · ${fmtR(w.netR)} of +${w.goalR}R goal`;
+  }
+  el.className = `signal ${cls}`;
+  el.innerHTML = '';
+  const h = document.createElement('div'); h.className = 'signal-head'; h.textContent = head;
+  const p = document.createElement('div'); p.className = 'signal-sub'; p.textContent = sub;
+  el.append(h, p);
+}
+
+function planPipValue() {
+  const input = document.getElementById('plan-pip-value');
+  const v = parseFloat(input.value);
+  return v > 0 ? v : 10;
+}
+
+function renderPlanTicket(st) {
+  const t = st.ticket;
+  const equity = st.equityNow;
+  const set = (id, txt) => { document.getElementById(id).textContent = txt; };
+
+  set('ticket-stage', `${st.stage.label}${st.stage.kind === 'tier' ? ' · risk follows equity' : ''}`);
+  set('ticket-risk', formatMoney(t.riskDollars));
+  set('ticket-risk-hint', `${t.riskPct}% of ${formatMoney(equity)}`);
+
+  const lots = SizingEngine.lotsForRisk({ riskDollars: t.riskDollars, stopPips: t.stopPips, pipValuePerLot: planPipValue(), runner: t.runner });
+  set('ticket-lots', lots.total.toFixed(2));
+  let lotsHint = `real risk ${formatMoney(lots.riskActual)}`;
+  if (lots.riskActual > t.riskDollars * 1.001) lotsHint = `0.01 is the minimum lot — risk is ${formatMoney(lots.riskActual)}, above the plan`;
+  else if (t.runner && lots.legB > 0) lotsHint = `A ${lots.legA.toFixed(2)} → +${t.targetPips} · B ${lots.legB.toFixed(2)} → +${t.runnerTargetPips} · risk ${formatMoney(lots.riskActual)}`;
+  set('ticket-lots-hint', lotsHint);
+
+  set('ticket-stop', `${t.stopPips} pips`);
+  set('ticket-stop-hint', `skip the setup if structure needs > ${st.plan.trade.maxStopPips}`);
+  set('ticket-be', `+${t.bePips} pips`);
+  set('ticket-target', `+${t.targetPips} pips`);
+  set('ticket-target-hint', t.runner && t.runnerTargetPips ? `${(t.targetPips / t.stopPips).toFixed(0)}R · runner leg +${t.runnerTargetPips}` : `${(t.targetPips / t.stopPips).toFixed(0)}R`);
+  set('ticket-pl', `+${formatMoney(t.winDollars)} / −${formatMoney(t.riskDollars)}`);
+}
+
+function renderPlanWeek(st) {
+  const w = st.week;
+  const t = st.ticket;
+  document.getElementById('week-label').textContent = `Week of ${fmtDay(w.start)}`;
+  const net = document.getElementById('week-net');
+  net.textContent = `${fmtR(w.netR)}  ≈ ${w.netR >= 0 ? '+' : '−'}${formatMoney(Math.abs(w.netR * t.riskDollars))}`;
+  net.classList.toggle('win-text', w.netR > 0);
+  net.classList.toggle('loss-text', w.netR < 0);
+
+  const span = w.goalR - w.capR;                       // e.g. 4 - (-2) = 6
+  const zeroPct = ((0 - w.capR) / span) * 100;         // where 0R sits on the bar
+  const netPct = (Math.max(w.capR, Math.min(w.goalR, w.netR)) / span) * 100;
+  const fill = document.getElementById('week-meter-fill');
+  fill.classList.toggle('neg', w.netR < 0);
+  fill.style.left = `${netPct >= 0 ? zeroPct : zeroPct + netPct}%`;
+  fill.style.width = `${Math.abs(netPct)}%`;
+  document.getElementById('week-meter-zero').style.left = `${zeroPct}%`;
+  document.getElementById('week-cap-label').textContent = `cap ${w.capR}R (−${formatMoney(Math.abs(t.weeklyCapDollars))})`;
+  document.getElementById('week-goal-label').textContent = `goal +${w.goalR}R (+${formatMoney(t.weeklyGoalDollars)})`;
+  document.getElementById('week-detail').textContent = `${w.trades} of ${w.maxTrades} trades taken this week`;
+}
+
+function renderPlanRoad(st) {
+  const el = document.getElementById('road');
+  el.innerHTML = '';
+  st.road.forEach((r) => {
+    const item = document.createElement('div');
+    item.className = `road-item ${r.status} ${r.kind === 'milestone' || r.kind === 'goal' ? r.kind : ''}`;
+
+    const title = document.createElement('div');
+    title.className = 'road-title';
+    const name = document.createElement('span'); name.textContent = r.label;
+    title.appendChild(name);
+    const range = document.createElement('span');
+    range.className = 'road-range';
+    range.textContent = r.kind === 'step' || r.kind === 'tier' ? `${r.from === 0 ? 'up to' : formatMoney(r.from, false).replace('.00', '') + ' –'} ${formatMoney(r.to).replace('.00', '')}` : r.rule;
+    title.appendChild(range);
+    if (r.status === 'current') { const b = document.createElement('span'); b.className = 'road-badge'; b.textContent = 'you are here'; title.appendChild(b); }
+    item.appendChild(title);
+
+    if (r.kind === 'step' || r.kind === 'tier') {
+      const rule = document.createElement('div'); rule.className = 'road-rule'; rule.textContent = r.rule; item.appendChild(rule);
+      if (r.detail) { const d = document.createElement('div'); d.className = 'road-detail'; d.textContent = r.detail; item.appendChild(d); }
+      if (r.status === 'current' && st.gate && st.gate.equityReady && !st.gate.isLast) {
+        const n = document.createElement('div'); n.className = 'road-detail';
+        n.textContent = 'Equity already qualifies for the next step — earn it with clean trades.'; item.appendChild(n);
+      }
+      if (r.status !== 'upcoming') {
+        const bar = document.createElement('div'); bar.className = 'road-bar';
+        const fillEl = document.createElement('div'); fillEl.style.width = `${Math.round((r.status === 'done' ? 1 : r.progress) * 100)}%`;
+        bar.appendChild(fillEl); item.appendChild(bar);
+      }
+    }
+    el.appendChild(item);
+  });
+}
+
+function renderPlanGate(st) {
+  const title = document.getElementById('gate-title');
+  const note = document.getElementById('gate-note');
+  const slots = document.getElementById('gate-slots');
+  const reqs = document.getElementById('gate-reqs');
+  slots.innerHTML = ''; reqs.innerHTML = '';
+
+  if (!st.gate) {
+    const tiers = st.plan.tiers;
+    const idx = tiers.findIndex((t) => t.id === st.stage.id);
+    const next = tiers[idx + 1];
+    title.textContent = `${st.stage.label} — risk follows equity`;
+    note.textContent = next ? `next tier at ${formatMoney(next.equityFrom).replace('.00', '')}` : 'top tier';
+    const li = document.createElement('li');
+    li.innerHTML = '';
+    li.textContent = `Risk is ${st.stage.riskPct}% of equity — ${formatMoney(st.ticket.riskDollars)} on the next trade. No step count here; the weekly goal and cap still apply.`;
+    reqs.appendChild(li);
+    return;
+  }
+
+  const g = st.gate;
+  title.textContent = `${g.from} → ${g.to}`;
+  note.textContent = g.isLast ? '' : `${fmtR(g.netR)} over the last ${st.plan.stepGate.trades}`;
+
+  if (!g.isLast) {
+    g.slots.forEach((s) => {
+      const chip = document.createElement('div');
+      if (!s) { chip.className = 'chip-r chip-empty'; chip.textContent = '·'; }
+      else {
+        chip.className = `chip-r ${s.r > 0 ? 'chip-win' : s.r < 0 ? 'chip-loss' : 'chip-be'}`;
+        chip.textContent = s.r > 0 ? 'W' : s.r < 0 ? 'L' : 'BE';
+        const small = document.createElement('small'); small.textContent = fmtR(s.r); chip.appendChild(small);
+        if (!s.clean) chip.title = 'rule break on this trade';
+      }
+      slots.appendChild(chip);
+    });
+  }
+  g.requirements.forEach((r) => {
+    const li = document.createElement('li');
+    li.className = r.ok ? 'ok' : 'no';
+    const tick = document.createElement('span'); tick.className = 'tick'; tick.textContent = r.ok ? '✓' : '✗';
+    const label = document.createElement('span'); label.textContent = r.label;
+    const detail = document.createElement('span'); detail.className = 'detail'; detail.textContent = r.detail;
+    li.append(tick, label, detail);
+    reqs.appendChild(li);
+  });
+}
+
+function renderPlanPace(st) {
+  const p = st.pace;
+  const statusEl = document.getElementById('pace-status');
+  const goalDate = p.path[p.path.length - 1].date;
+  document.getElementById('pace-note').textContent = `${formatMoney(st.plan.target).replace('.00', '')} by ${fmtDay(goalDate)} ${goalDate.slice(0, 4)} · needs ${p.monthlyGrowthPct}% a month`;
+
+  const eq = `equity ex-deposits ${formatMoney(p.adjustedEquity)} vs path ${formatMoney(p.expectedEquity)}`;
+  let cls, msg;
+  if (p.elapsedMonths < 0.25 && p.status !== 'far') { cls = 'pace-on'; msg = `Just started — ${eq}.`; }
+  else if (p.status === 'on') { cls = 'pace-on'; msg = `On pace — ${eq}.`; }
+  else if (p.status === 'behind') { cls = 'pace-behind'; msg = `Behind the path by ${Math.abs(p.monthsAhead).toFixed(1)} months — ${eq}. Extend the date; don't raise the risk.`; }
+  else { cls = 'pace-far'; msg = `Well behind the path — ${eq}. Extend the date; don't raise the risk to catch up.`; }
+  statusEl.className = `pace-status ${cls}`;
+  statusEl.textContent = msg;
+
+  if (typeof Chart === 'undefined') return;
+  if (planPaceChart) { planPaceChart.destroy(); planPaceChart = null; }
+  const accent = cssVar('--accent');
+  const muted = cssVar('--text-muted');
+  const grid = cssVar('--border');
+  planPaceChart = new Chart(document.getElementById('plan-pace-chart').getContext('2d'), {
+    type: 'line',
+    data: {
+      datasets: [
+        { label: 'Path', data: p.path.map((x) => ({ x: x.month, y: x.equity })), borderColor: muted, borderDash: [6, 5], borderWidth: 1.5, pointRadius: 2, fill: false },
+        { label: 'You (ex-deposits)', data: p.actual.map((x) => ({ x: x.x, y: Math.max(1, x.y) })), borderColor: accent, backgroundColor: 'rgba(31, 227, 196, 0.07)', borderWidth: 2, pointRadius: 2, tension: 0.1, fill: false },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: true, labels: { color: muted } } },
+      scales: {
+        x: { type: 'linear', min: 0, max: st.plan.months, ticks: { color: muted, stepSize: 1, callback: (v) => `M${v}` }, grid: { color: grid } },
+        y: { type: 'logarithmic', ticks: { color: muted, callback: (v) => `$${v}` }, grid: { color: grid } },
+      },
+    },
+  });
+}
+
+function renderPlanAudit(st) {
+  const a = st.audit;
+  document.getElementById('audit-note').textContent = a.planTrades === 0
+    ? 'no trades since the start date'
+    : `${a.planTrades} plan trades · ${a.clean} clean · ${a.flagged} flagged · ${a.unverified} without a checklist`;
+
+  const strip = document.getElementById('week-strip');
+  strip.innerHTML = '';
+  if (st.weeks.length === 0) {
+    const none = document.createElement('div'); none.className = 'kpi-hint'; none.textContent = 'No weeks logged yet.'; strip.appendChild(none);
+  }
+  st.weeks.forEach((wk) => {
+    const chip = document.createElement('div');
+    chip.className = `chip-r ${wk.netR > 0 ? 'chip-win' : wk.netR < 0 ? 'chip-loss' : 'chip-be'}`;
+    chip.textContent = fmtR(wk.netR);
+    const small = document.createElement('small'); small.textContent = fmtDay(wk.weekStart); chip.appendChild(small);
+    chip.title = `${wk.trades} trades · ${wk.outcome === 'goal' ? 'goal reached' : wk.outcome === 'cap' ? 'cap hit' : wk.outcome === 'limit' ? 'trade limit' : 'open'}`;
+    strip.appendChild(chip);
+  });
+
+  const list = document.getElementById('audit-list');
+  list.innerHTML = '';
+  if (a.planTrades > 0 && a.flags.length === 0) {
+    const li = document.createElement('li'); li.textContent = 'No rule breaks logged.'; list.appendChild(li);
+  }
+  a.flags.slice(-8).reverse().forEach((f) => {
+    const li = document.createElement('li');
+    const n = document.createElement('span'); n.className = 'audit-num'; n.textContent = `#${f.trade_number}${f.pair ? ' ' + f.pair : ''}`;
+    li.append(n, document.createTextNode(f.reasons.join(' · ')));
+    list.appendChild(li);
+  });
+  if (a.noR > 0) {
+    const li = document.createElement('li');
+    li.textContent = `${a.noR} trade${a.noR === 1 ? ' has' : 's have'} no R-multiple (no stop or risk recorded), so they don't count toward the weekly meter or the step.`;
+    list.appendChild(li);
+  }
+}
+
+function wirePlan() {
+  document.getElementById('plan-save-btn').addEventListener('click', () => savePlanConfig(false));
+  document.getElementById('plan-restart-btn').addEventListener('click', () => savePlanConfig(true));
+
+  const pip = document.getElementById('plan-pip-value');
+  try { const saved = localStorage.getItem('cliffPipValue'); if (saved) pip.value = saved; } catch (_) { /* storage unavailable */ }
+  pip.addEventListener('input', () => {
+    try { localStorage.setItem('cliffPipValue', pip.value); } catch (_) { /* storage unavailable */ }
+    if (currentPlanState && currentPlanState.started) runSafely('plan ticket', () => renderPlanTicket(currentPlanState));
+  });
+}
+
 function wireChartControls() {
   const bind = (containerId, attr, setter) => {
     document.querySelectorAll(`#${containerId} button`).forEach((btn) => {
@@ -492,8 +871,9 @@ function renderTradeLog() {
   document.getElementById('all-trades-empty').classList.toggle('hidden', currentTrades.length > 0);
   [...currentTrades].reverse().forEach((t) => tbody.appendChild(tradeRow(t, true)));
 
+  const plan = currentPlanState && currentPlanState.started ? currentPlanState : null;
   const next = nextRisk();
-  const suggestedDollars = SizingEngine.riskPctToAmount(next.riskPct, currentBalance());
+  const suggestedDollars = plan ? plan.ticket.riskDollars : SizingEngine.riskPctToAmount(next.riskPct, currentBalance());
   if (suggestedDollars !== null) {
     document.getElementById('trade-risk-mode').value = 'dollar';
     document.getElementById('trade-risk-value-label').textContent = 'Risk $ amount (this trade)';
@@ -505,14 +885,19 @@ function renderTradeLog() {
   }
   // Left blank on purpose (placeholder only): a pre-filled default would get recorded as if it were the real stop.
   document.getElementById('trade-sl-pips').value = '';
-  document.getElementById('trade-sl-pips').placeholder = String(currentSettings.default_stop_loss_pips);
-  document.getElementById('trade-date').value = new Date().toISOString().slice(0, 10);
+  document.getElementById('trade-sl-pips').placeholder = String(plan ? plan.ticket.stopPips : currentSettings.default_stop_loss_pips);
+  document.getElementById('trade-date').value = todayLocalISO();
   updateRiskValueHint();
   updateSuggestedUnits();
 
-  const streakNote = next.streakType
+  let streakNote = next.streakType
     ? `Suggested from ${streakLabel(next.streakType, next.streakCount)} in a row.`
     : 'First trade on this account — using base risk.';
+  if (plan) {
+    streakNote = plan.week.status === 'open'
+      ? `Plan: ${plan.stage.label} — risk ${formatMoney(plan.ticket.riskDollars)}, stop ${plan.ticket.stopPips} pips.`
+      : 'Plan says: stop for the week (goal, cap or trade limit reached).';
+  }
   document.getElementById('suggested-risk-note').textContent = streakNote;
 
   document.getElementById('trade-instrument-type').value = 'forex';
@@ -534,7 +919,7 @@ function addQuickAddRow() {
   const tbody = document.querySelector('#quick-add-table tbody');
   const tr = document.createElement('tr');
   tr.innerHTML = `
-    <td><input type="date" class="qa-date" value="${new Date().toISOString().slice(0, 10)}" /></td>
+    <td><input type="date" class="qa-date" value="${todayLocalISO()}" /></td>
     <td><input type="text" class="qa-pair" placeholder="GOLD" /></td>
     <td>
       <select class="qa-direction">
@@ -849,7 +1234,7 @@ function wireTradeForm() {
     const checklistIsEmpty = !checklist.scenario && SizingEngine.CHECKLIST_RULES.every((r) => !checklist[r.key]);
     let payload = {
       account_id: currentAccount.id,
-      trade_date: tradeDate || new Date().toISOString().slice(0, 10),
+      trade_date: tradeDate || todayLocalISO(),
       pair: pair || null,
       direction,
       result,
